@@ -1,0 +1,63 @@
+# 创建conda环境
+conda create -n mmrotate python=3.8
+
+# 激活环境
+conda activate mmrotate
+
+# 安装 PyTorch 
+pip install torch==1.13.1+cu117 torchvision==0.14.1+cu117 -f https://download.pytorch.org/whl/torch_stable.html
+
+#  使用 MIM 安装 MMCV 和 MMDetection 
+pip install opencv-python==4.12.0.88 -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install mmcv-full==1.7.2 -f https://download.openmmlab.com/mmcv/dist/cu117/torch1.13/index.html   目前卡在这里
+
+# 安装mmdet 
+pip install mmdet==2.28.2
+
+#  安装git
+winget install --id Git.Git -e --source winget
+ 
+ # 拉取源码
+git clone https://github.com/open-mmlab/mmrotate.git
+
+cd mmrotate
+pip install -r requirements/build.txt
+pip install -v -e .
+
+pip uninstall -y yapf
+pip install yapf==0.40.1
+
+# 删除图像包send2trash安装
+pip install send2trash
+
+
+#图像合并工具安装
+mkdir -p tools/DOTA_devkit
+git clone https://github.com/CAPTAIN-WHU/DOTA_devkit.git tools/DOTA_devkit
+pip install scipy shapely matplotlib opencv-python pandas
+
+#自定义合并脚本tools/merge_dota_results.py
+import argparse
+import os
+import sys
+
+# 添加 DOTA_devkit 路径
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../utils/DOTA_devkit'))
+from ResultMerge import mergebypoly
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--split_dir', help='裁剪图像目录', default='data/dota/test/split')
+    parser.add_argument('--result_dir', help='检测结果目录', default='runs/DOTA/split_results')
+    parser.add_argument('--merge_dir', help='合并结果目录', default='runs/DOTA/merged_results')
+    parser.add_argument('--iou_thresh', type=float, default=0.1, help='IOU 阈值')
+    args = parser.parse_args()
+    
+    # 确保目录存在
+    os.makedirs(args.merge_dir, exist_ok=True)
+    
+    # 调用合并函数
+    mergebypoly(args.split_dir, args.result_dir, args.merge_dir, args.iou_thresh)
+
+if __name__ == '__main__':
+    main()
