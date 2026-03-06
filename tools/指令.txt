@@ -24,6 +24,8 @@ screen -r train  # 重新连接screen
 screen -ls
 screen -X -S mmrotate_train quit
 
+git status
 git add .
 git commit -m "更新"
 git push -u origin main
+git pull origin main
