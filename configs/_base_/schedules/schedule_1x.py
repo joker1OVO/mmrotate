@@ -7,7 +7,7 @@ optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2),type='GradientC
 lr_config = dict(
     policy='step', # 学习率调整策略为 step，即按固定步长调整学习率。
     warmup='linear', # 使用 线性预热（linear warmup） 策略，逐渐增加学习率。
-    warmup_iters=500, # 预热阶段的迭代次数为 500。
+    warmup_iters=1000, # 预热阶段的迭代次数为 500。
     warmup_ratio=1.0 / 3, #预热阶段的学习率从初始学习率的 1/3 开始。
     step=[8, 11]) # 在第 8 和第 11 个 epoch 时，学习率会按一定比例下降（通常是乘以 0.1）。
 runner = dict(type='EpochBasedRunner', max_epochs=12) # 使用基于 epoch 的训练循环。最大训练 epoch 数为 12。
