@@ -3,7 +3,7 @@ _base_ = [...]
 from mmdet.models.builder import NECKS
 import torch.nn as nn
 @NECKS.register_module()
-class noNeck(nn.Module):
+class noFpn(nn.Module):
     def __init__(self):
         super().__init__()
     def forward(self, inputs):

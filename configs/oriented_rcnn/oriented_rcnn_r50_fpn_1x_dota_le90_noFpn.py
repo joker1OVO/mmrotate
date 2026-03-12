@@ -17,7 +17,7 @@ model = dict(
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
-        type='noNeck',
+        type='noFpn',
         ),
     rpn_head=dict(
         type='OrientedRPNHead',
