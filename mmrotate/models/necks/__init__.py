@@ -3,4 +3,5 @@ from  .hs_fpn import HSFPN
 from .re_fpn import ReFPN
 from .saff_neck import SAFFNeck
 from .re_fpn_mrf45 import re_fpn_mrf45
-__all__ = ['HSFPN','ReFPN','re_fpn_mrf45', 'SAFFNeck']
+from noFpn import noNeck
+__all__ = ['HSFPN','ReFPN','re_fpn_mrf45', 'SAFFNeck','noNeck']
