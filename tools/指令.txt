@@ -29,4 +29,4 @@ git add .
 git commit -m "更新"
 git push -u origin main
 git pull origin main
-./train.sh oriented_rcnn_r50_fpn_1x_dota_le90_noFpn.py noFpn
+./train.sh oriented_rcnn_r50_fpn_1x_dota_le90.py Oriented_rcnn
