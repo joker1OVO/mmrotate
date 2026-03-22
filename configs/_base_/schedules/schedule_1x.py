@@ -1,7 +1,7 @@
 # evaluation
 evaluation = dict(interval=4, metric='mAP') # 表示每训练 1 个 epoch 后进行模型评估。
 # optimizer
-optimizer = dict(type='SGD', lr=0.0025, momentum=0.9, weight_decay=0.0001) # 使用 随机梯度下降（SGD）作为优化器.学习率（learning rate）设置为 0.0025。动量（momentum）设置为 0.9，用于加速 SGD 的收敛。权重衰减（weight decay）设置为 0.0001，用于正则化，防止过拟合。
+optimizer = dict(type='SGD', lr=0.005, momentum=0.9, weight_decay=0.0001) # 使用 随机梯度下降（SGD）作为优化器.学习率（learning rate）设置为 0.0025。动量（momentum）设置为 0.9，用于加速 SGD 的收敛。权重衰减（weight decay）设置为 0.0001，用于正则化，防止过拟合。
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2),type='GradientCumulativeOptimizerHook',cumulative_iters=2) # 梯度累积：2，梯度裁剪（gradient clipping）配置，用于防止梯度爆炸。梯度的最大范数为 35。使用 L2 范数进行梯度裁剪。
 # learning policy
 lr_config = dict(
