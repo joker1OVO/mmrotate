@@ -5,4 +5,5 @@ from .saff_neck import SAFFNeck
 from .re_fpn_mrf45 import re_fpn_mrf45
 from .noFpn import noFpn
 from .faafusion import FAAFusionFPN
-__all__ = ['HSFPN','ReFPN','re_fpn_mrf45', 'SAFFNeck','noFpn','FAAFusionFPN']
+from .afe import AngleFreqEnhanceFPN
+__all__ = ['HSFPN','ReFPN','re_fpn_mrf45', 'SAFFNeck','noFpn','FAAFusionFPN','AngleFreqEnhanceFPN']
