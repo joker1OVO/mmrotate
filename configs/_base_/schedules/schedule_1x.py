@@ -14,7 +14,7 @@ lr_config = dict(
     warmup_iters=500,
     warmup_ratio=1.0 / 3,
     step=[8, 11])
-runner = dict(type='EpochBasedRunner', max_epochs=16)
+runner = dict(type='EpochBasedRunner', max_epochs=12)
 checkpoint_config = dict(
     interval=1,          # 每隔 1 个 epoch 保存一次权重
     max_keep_ckpts=7     # 只保留最新的 7 个 checkpoint

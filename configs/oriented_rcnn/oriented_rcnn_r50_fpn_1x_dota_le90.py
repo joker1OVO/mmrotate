@@ -142,3 +142,5 @@ data = dict(
     train=dict(pipeline=train_pipeline, version=angle_version),
     val=dict(version=angle_version),
     test=dict(version=angle_version))
+
+optimizer = dict(lr=0.005)
