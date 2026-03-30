@@ -1,10 +1,12 @@
-# mmrotate/models/necks/angle_freq_enhance.py
+# mmrotate/models/necks/angle_freq_enhance_fpn.py
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mmcv.runner import auto_fp16
+from mmdet.models.necks.fpn import FPN
 from ..builder import ROTATED_NECKS
+from typing import List, Optional
 
 
 class AngleFreqEnhance(nn.Module):
@@ -35,8 +37,8 @@ class AngleFreqEnhance(nn.Module):
         self.c_mid = c_mid
         self.eps = eps
 
-        # 通道压缩与恢复
-        self.proj_in = nn.Conv2d(256, c_mid, kernel_size=1, bias=False)   # 输入通道固定为 256（FPN 输出）
+        # 通道压缩与恢复（假设输入通道为 256，即 FPN 输出通道）
+        self.proj_in = nn.Conv2d(256, c_mid, kernel_size=1, bias=False)
         self.proj_out = nn.Conv2d(c_mid, 256, kernel_size=1, bias=False)
 
         if learnable_weights:
@@ -44,7 +46,7 @@ class AngleFreqEnhance(nn.Module):
         else:
             self.register_buffer('angle_weights', torch.full((n_angles,), enhance_init))
 
-        # 预计算掩码的占位符（在第一次 forward 时根据分辨率生成）
+        # 预计算掩码的占位符
         self.register_buffer('angle_idx', None)
         self.register_buffer('high_freq_mask', None)
 
@@ -108,3 +110,76 @@ class AngleFreqEnhance(nn.Module):
             return x + x_enh
         else:
             return x_enh
+
+
+@ROTATED_NECKS.register_module()
+class AngleFreqEnhanceFPN(FPN):
+    """
+    支持在指定输出层应用频域角度高频增强的 FPN。
+
+    参数:
+        enhance_layers (list[int]): 要增强的 FPN 输出层索引（从 0 开始），
+                                    例如 [0] 表示只增强 P2。
+        enhance_configs (dict or list[dict]): 每个增强层的配置，若为 dict 则所有层共享。
+        ... (其他 FPN 参数)
+    """
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 num_outs,
+                 enhance_layers: List[int],
+                 enhance_configs: Optional[dict] = None,
+                 start_level=0,
+                 end_level=-1,
+                 add_extra_convs=False,
+                 relu_before_extra_convs=False,
+                 no_norm_on_lateral=False,
+                 conv_cfg=None,
+                 norm_cfg=None,
+                 act_cfg=None,
+                 upsample_cfg=dict(mode='nearest'),
+                 init_cfg=dict(type='Xavier', layer='Conv2d', distribution='uniform')):
+        super().__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            num_outs=num_outs,
+            start_level=start_level,
+            end_level=end_level,
+            add_extra_convs=add_extra_convs,
+            relu_before_extra_convs=relu_before_extra_convs,
+            no_norm_on_lateral=no_norm_on_lateral,
+            conv_cfg=conv_cfg,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg,
+            upsample_cfg=upsample_cfg,
+            init_cfg=init_cfg)
+
+        self.enhance_layers = enhance_layers
+
+        # 构建增强模块
+        if enhance_configs is None:
+            enhance_configs = dict()
+        if isinstance(enhance_configs, dict):
+            self.enhance_modules = nn.ModuleList([
+                AngleFreqEnhance(**enhance_configs) for _ in enhance_layers
+            ])
+        elif isinstance(enhance_configs, list):
+            assert len(enhance_configs) == len(enhance_layers), \
+                "enhance_configs length must match enhance_layers length"
+            self.enhance_modules = nn.ModuleList([
+                AngleFreqEnhance(**cfg) for cfg in enhance_configs
+            ])
+        else:
+            raise TypeError("enhance_configs must be dict or list of dict")
+
+    @auto_fp16()
+    def forward(self, inputs):
+        # 先调用父类前向，得到原始 FPN 输出列表
+        outs = super().forward(inputs)  # tuple of Tensors
+
+        # 对指定层应用增强
+        outs = list(outs)
+        for idx, layer_idx in enumerate(self.enhance_layers):
+            if layer_idx < len(outs):
+                outs[layer_idx] = self.enhance_modules[idx](outs[layer_idx])
+        return tuple(outs)
