@@ -18,17 +18,23 @@ model = dict(
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
         type='AngleFreqEnhanceFPN',
-        in_channels=[256, 512, 1024, 2048],  # 与 backbone 输出通道一致
-        out_channels=256,  # 输出通道数
-        num_outs=5,  # 输出层数（P2~P6）
-        enhance_layers=[0],  # 只对第一层（P2）增强，索引0对应P2
-        enhance_configs=dict(
-            n_angles=8,  # 角度扇区数（8个，每个45°）
-            high_freq_ratio=0.3,  # 高频阈值（半径>0.3*最大半径视为高频）
-            learnable_weights=True,  # 学习角度权重
-            enhance_init=1.0,  # 初始增强系数
-            residual=True,  # 使用残差连接
-        )),
+        in_channels=[256, 512, 1024, 2048],
+        out_channels=256,
+        num_outs=5,
+        # 新增/修改参数
+        enhance_levels=[0, 1, 2, 3],  # 对应 P2, P3, P4, P5 全部增强
+        afe_cfg=dict(
+            n_angles=32,
+            high_freq_ratio=0.3,
+            learnable_weights=True,
+            enhance_init=1.0,
+            residual=True,
+            c_mid=32  # 稍微加大中间通道，提升表达能力
+        ),
+        # FPN 标准参数
+        start_level=0,
+        add_extra_convs='on_lateral',  # 常用设置
+    ),
     rpn_head=dict(
         type='OrientedRPNHead',
         in_channels=256,
