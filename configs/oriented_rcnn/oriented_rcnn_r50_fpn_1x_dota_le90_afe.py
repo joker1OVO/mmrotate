@@ -21,19 +21,26 @@ model = dict(
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
         num_outs=5,
-        # 新增/修改参数
-        enhance_levels=[0, 1, 2, 3],  # 对应 P2, P3, P4, P5 全部增强
-        afe_cfg=dict(
-            n_angles=32,
-            high_freq_ratio=0.3,
-            learnable_weights=True,
-            enhance_init=1.0,
-            residual=True,
-            c_mid=32  # 稍微加大中间通道，提升表达能力
+        # 应用增强的层（P2~P5 索引0~3）
+        enhance_levels=[0, 1, 2, 3],
+        # 小目标层（P2,P3）使用 'small' 策略：增强主频方向的高频
+        small_levels=[0, 1],
+        # 大目标层（P4,P5）使用 'large' 策略：增强垂直方向的低频
+        large_levels=[2, 3],
+        # 基础AFE配置（所有层共享，但策略自动选择）
+        afe_base_cfg=dict(
+            k_peaks=2,  # 主频方向数量
+            angle_bandwidth=15.0,  # 角度带宽（度）
+            high_freq_ratio=0.3,  # 高频半径比例
+            low_freq_ratio=0.2,  # 低频半径比例
+            enhance_alpha=1.2,  # 增强系数
+            suppress_beta=0.8,  # 削弱系数（其他方向高频）
+            residual=True,  # 残差连接
+            c_mid=16,  # 中间通道压缩数
         ),
         # FPN 标准参数
         start_level=0,
-        add_extra_convs='on_lateral',  # 常用设置
+        add_extra_convs='on_lateral',
     ),
     rpn_head=dict(
         type='OrientedRPNHead',
