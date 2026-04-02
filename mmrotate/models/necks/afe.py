@@ -59,7 +59,7 @@ class AngleFreqEnhance(nn.Module):
         # 预计算掩码的占位符（极坐标网格）
         self.register_buffer('angle_grid', None)  # [H, W] 角度值（弧度）
         self.register_buffer('radius_grid', None)  # [H, W] 半径值
-        self.register_buffer('r_max', None)
+        self.r_max = None
 
     def _compute_grid(self, H: int, W: int, device: torch.device):
         """计算极坐标网格（角度和半径），缓存"""
@@ -67,11 +67,11 @@ class AngleFreqEnhance(nn.Module):
             cy, cx = H // 2, W // 2
             y, x = torch.meshgrid(torch.arange(H, device=device),
                                   torch.arange(W, device=device), indexing='ij')
-            r = torch.sqrt((y - cy) ** 2 + (x - cx) ** 2)
+            r = torch.sqrt((y - cy)**2 + (x - cx)**2)
             theta = torch.atan2(y - cy, x - cx) + math.pi  # [0, 2π)
             self.angle_grid = theta
             self.radius_grid = r
-            self.r_max = min(cy, cx) if min(cy, cx) > 0 else 1
+            self.r_max = min(cy, cx)  # 标量 int
 
     def _get_peak_directions(self, mag: torch.Tensor):
         """
