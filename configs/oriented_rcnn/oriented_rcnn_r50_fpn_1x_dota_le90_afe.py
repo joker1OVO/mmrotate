@@ -18,29 +18,23 @@ model = dict(
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
         type='AngleFreqEnhanceFPN',
-        in_channels=[256, 512, 1024, 2048],
-        out_channels=256,
-        num_outs=5,
-        # 应用增强的层（P2~P5 索引0~3）
-        enhance_levels=[0, 1, 2, 3],
-        # 小目标层（P2,P3）使用 'small' 策略：增强主频方向的高频
-        small_levels=[0, 1],
-        # 大目标层（P4,P5）使用 'large' 策略：增强垂直方向的低频
-        large_levels=[2, 3],
-        # 基础AFE配置（所有层共享，但策略自动选择）
-        afe_base_cfg=dict(
-            k_peaks=2,  # 主频方向数量
-            angle_bandwidth=15.0,  # 角度带宽（度）
-            high_freq_ratio=0.3,  # 高频半径比例
-            low_freq_ratio=0.2,  # 低频半径比例
-            enhance_alpha=1.4,  # 增强系数
-            suppress_beta=0.6,  # 削弱系数（其他方向高频）
+        in_channels=[256, 512, 1024, 2048],  # ResNet50/101 的 C2~C5 通道数
+        out_channels=256,  # FPN 输出特征图通道数，通常设为 256
+        num_outs=5,  # 最终输出特征图数量（P2~P5，可能加上 P6）
+        start_level=1,  # 从 C2 开始构建 FPN
+        add_extra_convs='on_input',  # 是否生成额外特征图（如 P6）
+        relu_before_extra_convs=True,
+        enhance_levels=[0, 1, 2, 3],  # 对所有 4 个层级（P2~P5）进行增强
+        afe_cfg=dict(  # AFE 模块的统一配置
+            n_angles=32,  # 离散角度数量
+            c_mid=16,  # 中间层通道数，压缩到 16 以降低计算量[reference:1]
+            learnable_weights=True,  # 角度权重是否可学习
+            enhance_init=1.0,  # 角度权重初始值
+            high_freq_ratio=0.3,  # 高频区域阈值
             residual=True,  # 残差连接
-            c_mid=16,  # 中间通道压缩数
+            eps=1e-8
         ),
-        # FPN 标准参数
-        start_level=0,
-        add_extra_convs='on_lateral',
+        upsample_cfg=dict(mode='nearest')  # 上采样配置
     ),
     rpn_head=dict(
         type='OrientedRPNHead',
