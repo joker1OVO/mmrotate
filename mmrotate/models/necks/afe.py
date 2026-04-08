@@ -3,6 +3,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mmcv.runner import auto_fp16
+from mmdet.models.necks.fpn import FPN
+from ..builder import ROTATED_NECKS
+from typing import List, Optional
+
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from mmcv.runner import auto_fp16
 from ..builder import ROTATED_NECKS
 
 class AngleFreqEnhance(nn.Module):
@@ -174,3 +184,83 @@ class AngleFreqEnhance(nn.Module):
             return x + x_enh
         else:
             return x_enh
+
+
+@ROTATED_NECKS.register_module()
+class AngleFreqEnhanceFPN(FPN):
+    """
+    创新点：在 FPN 的侧向连接处对 P2-P5 分别进行频域角度增强，随后进行 Top-down 融合。
+    """
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 num_outs,
+                 # 控制哪些层需要 AFE，默认 [0,1,2,3] 对应 P2, P3, P4, P5
+                 enhance_levels: List[int] = [0, 1, 2, 3],
+                 afe_cfg: dict = dict(n_angles=32, c_mid=16),
+                 **kwargs):
+        super(AngleFreqEnhanceFPN, self).__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            num_outs=num_outs,
+            **kwargs)
+
+        self.enhance_levels = enhance_levels
+
+        # 为每个 backbone 级别构建独立的 AFE 模块
+        self.afe_modules = nn.ModuleList()
+        for i in range(len(in_channels)):
+            if i in enhance_levels:
+                # 传入 out_channels，因为 AFE 作用在侧向连接（256通道）之后
+                self.afe_modules.append(AngleFreqEnhance(in_channels=out_channels, **afe_cfg))
+            else:
+                self.afe_modules.append(nn.Identity())
+
+    @auto_fp16()
+    def forward(self, inputs):
+        # 1. 构建侧向连接并立即应用 AFE 增强
+        # laterals[0]->P2, laterals[1]->P3, laterals[2]->P4, laterals[3]->P5
+        laterals = []
+        for i, lateral_conv in enumerate(self.lateral_convs):
+            feat = lateral_conv(inputs[i + self.start_level])
+            # 对当前层进行 AFE 增强（P2-P5 独立处理）
+            feat = self.afe_modules[i](feat)
+            laterals.append(feat)
+
+        # 2. Top-down 融合
+        used_backbone_levels = len(laterals)
+        for i in range(used_backbone_levels - 1, 0, -1):
+            # 这里的融合逻辑：上一层上采样 + 当前层(已增强)
+            prev_shape = laterals[i - 1].shape[2:]
+            upsampled = F.interpolate(laterals[i], size=prev_shape, **self.upsample_cfg)
+            laterals[i - 1] = laterals[i - 1] + upsampled
+
+        # 3. 构建输出层 (P2-P5 的 3x3 卷积)
+        outs = [
+            self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)
+        ]
+
+        # 4. 额外的层 (如 P6, P7)
+        if self.num_outs > len(outs):
+            if not self.add_extra_convs:
+                for i in range(self.num_outs - used_backbone_levels):
+                    outs.append(F.max_pool2d(outs[-1], 1, stride=2))
+            else:
+                if self.add_extra_convs == 'on_input':
+                    extra_source = inputs[self.backbone_end_level - 1]
+                elif self.add_extra_convs == 'on_lateral':
+                    extra_source = laterals[-1]
+                elif self.add_extra_convs == 'on_output':
+                    extra_source = outs[-1]
+                else:
+                    raise NotImplementedError
+
+                outs.append(self.fpn_convs[used_backbone_levels](extra_source))
+                for i in range(used_backbone_levels + 1, self.num_outs):
+                    if self.relu_before_extra_convs:
+                        outs.append(self.fpn_convs[i](F.relu(outs[-1])))
+                    else:
+                        outs.append(self.fpn_convs[i](outs[-1]))
+
+        return tuple(outs)
