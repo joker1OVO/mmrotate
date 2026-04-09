@@ -23,9 +23,9 @@ model = dict(
         num_outs=5,
         enhance_levels=[0, 1, 2, 3],
         afe_cfg=dict(
-            k_peaks=1,  # 只取最强主方向
+            k_peaks=3,  # 只取最强主方向
             angle_bandwidth=15.0,  # 角度带宽15度
-            enhance_alpha=1.4,  # 增强倍数
+            enhance_alpha=1.3,  # 增强倍数
             enhance_perp=True,  # 同时增强垂直方向
             c_mid=16,  # 压缩通道数
             residual=True,
@@ -155,4 +155,4 @@ data = dict(
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 
-optimizer = dict(lr=0.005)
+optimizer = dict(lr=0.0001)
