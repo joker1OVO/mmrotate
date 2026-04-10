@@ -27,7 +27,7 @@ model = dict(
             angle_bandwidth=15.0,  # 角度带宽15度
             enhance_alpha=1.3,  # 增强倍数
             enhance_perp=True,  # 同时增强垂直方向
-            c_mid=16,  # 压缩通道数
+            c_mid=32,  # 压缩通道数
             residual=True,
         ),
         start_level=0,
@@ -155,4 +155,4 @@ data = dict(
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 
-optimizer = dict(lr=0.0001)
+optimizer = dict(lr=0.01)
