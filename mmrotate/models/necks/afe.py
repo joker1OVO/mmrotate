@@ -59,9 +59,11 @@ class FreqResidualModulation(nn.Module):
 
         # 3. 预测残差幅度谱 ΔM
         delta_mag = self.res_predictor(mag)   # [B, c_mid, H, W]
+        delta_mag = self.res_predictor(mag) * 0.1
 
         # 4. 幅度谱残差加法
         mag_enhanced = mag + delta_mag        # 可正可负，允许增强或抑制
+        mag_enhanced = torch.clamp(mag_enhanced, min=1e-6)
 
         # 5. 重构复数频谱
         x_fft_shift_enhanced = mag_enhanced * torch.exp(1j * phase)
