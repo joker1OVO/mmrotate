@@ -17,19 +17,10 @@ model = dict(
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
-        type='AngleFreqEnhanceFPN',
+        type='FPN',
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
-        num_outs=5,
-        enhance_levels=[0, 1, 2, 3],  # 对 P2~P5 的高层特征都进行调制
-        afe_cfg=dict(
-            c_mid=16,  # 压缩通道数
-            kernel_size=3,  # 残差预测器的卷积核大小
-            use_tanh=True,  # 限制 ΔM 在 [-1,1]
-        ),
-        start_level=0,
-        add_extra_convs='on_lateral',
-    ),
+        num_outs=5),
     rpn_head=dict(
         type='OrientedRPNHead',
         in_channels=256,
