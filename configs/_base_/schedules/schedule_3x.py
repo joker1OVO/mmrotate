@@ -12,3 +12,4 @@ lr_config = dict(
     step=[24, 33])
 runner = dict(type='EpochBasedRunner', max_epochs=36)
 checkpoint_config = dict(interval=36)
+
