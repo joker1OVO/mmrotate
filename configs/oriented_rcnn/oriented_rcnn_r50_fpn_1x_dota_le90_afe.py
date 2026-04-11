@@ -21,14 +21,11 @@ model = dict(
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
         num_outs=5,
-        enhance_levels=[0, 1, 2, 3],
+        enhance_levels=[0, 1, 2, 3],  # 对 P2~P5 的高层特征都进行调制
         afe_cfg=dict(
-            k_peaks=3,  # 只取最强主方向
-            angle_bandwidth=15.0,  # 角度带宽15度
-            enhance_alpha=1.3,  # 增强倍数
-            enhance_perp=True,  # 同时增强垂直方向
-            c_mid=32,  # 压缩通道数
-            residual=True,
+            c_mid=16,  # 压缩通道数
+            kernel_size=3,  # 残差预测器的卷积核大小
+            use_tanh=True,  # 限制 ΔM 在 [-1,1]
         ),
         start_level=0,
         add_extra_convs='on_lateral',
@@ -155,4 +152,4 @@ data = dict(
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 
-optimizer = dict(lr=0.01)
+optimizer = dict(lr=0.005)
