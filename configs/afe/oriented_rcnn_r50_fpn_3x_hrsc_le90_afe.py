@@ -1,5 +1,5 @@
 _base_ = [
-    '../_base_/datasets/dotav1.py', '../_base_/schedules/schedule_1x.py',
+    '../_base_/datasets/hrsc.py', '../_base_/schedules/schedule_3x.py',
     '../_base_/default_runtime.py'
 ]
 
@@ -11,17 +11,25 @@ model = dict(
         depth=50,
         num_stages=4,
         out_indices=(0, 1, 2, 3),
-        frozen_stages=1,
+        frozen_stages=-1,
         norm_cfg=dict(type='BN', requires_grad=True),
         norm_eval=True,
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
-        type='FPN',
+        type='AngleFreqEnhanceFPN',
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
-        start_level=1,
-        num_outs=3),
+        num_outs=5,
+        enhance_levels=[0, 1, 2, 3],  # 对 P2~P5 的高层特征都进行调制
+        afe_cfg=dict(
+            c_mid=16,  # 压缩通道数
+            kernel_size=3,  # 残差预测器的卷积核大小
+            use_tanh=True,  # 限制 ΔM 在 [-1,1]
+        ),
+        start_level=0,
+        add_extra_convs='on_lateral',
+    ),
     rpn_head=dict(
         type='OrientedRPNHead',
         in_channels=256,
@@ -31,7 +39,7 @@ model = dict(
             type='AnchorGenerator',
             scales=[8],
             ratios=[0.5, 1.0, 2.0],
-            strides=[8, 16, 32]),
+            strides=[4, 8, 16, 32, 64]),
         bbox_coder=dict(
             type='MidpointOffsetCoder',
             angle_range=angle_version,
@@ -51,13 +59,13 @@ model = dict(
                 sample_num=2,
                 clockwise=True),
             out_channels=256,
-            featmap_strides=[8, 16, 32]),
+            featmap_strides=[4, 8, 16, 32]),
         bbox_head=dict(
             type='RotatedShared2FCBBoxHead',
             in_channels=256,
             fc_out_channels=1024,
             roi_feat_size=7,
-            num_classes=15,
+            num_classes=1,
             bbox_coder=dict(
                 type='DeltaXYWHAOBBoxCoder',
                 angle_range=angle_version,
@@ -124,11 +132,11 @@ model = dict(
             max_per_img=2000)))
 
 img_norm_cfg = dict(
-    mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
+    mean=[21.55, 21.55, 21.55], std=[24.42, 24.42, 24.42], to_rgb=True)
 train_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='LoadAnnotations', with_bbox=True),
-    dict(type='RResize', img_scale=(1024, 1024)),
+    dict(type='RResize', img_scale=(800, 800)),
     dict(
         type='RRandomFlip',
         flip_ratio=[0.25, 0.25, 0.25],
@@ -143,3 +151,11 @@ data = dict(
     train=dict(pipeline=train_pipeline, version=angle_version),
     val=dict(version=angle_version),
     test=dict(version=angle_version))
+
+
+anchor_generator = dict(
+    scales=[32, 64, 128],  # 原始通常为[8,16,32]
+    ratios=[0.5, 1.0, 2.0],
+    strides=[4, 8, 16, 32, 64]
+)
+

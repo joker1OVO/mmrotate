@@ -11,7 +11,7 @@ if [ $# -ne 2 ]; then
 fi
 
 # 自动添加前缀路径
-CONFIG="configs/$1"
+CONFIG="configs/afe/$1"
 WORK_DIR="runs/DOTA/$2"
 RESULT="$2"
 # 训练
