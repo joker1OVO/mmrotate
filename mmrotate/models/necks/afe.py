@@ -1,8 +1,9 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mmcv.runner import auto_fp16
+from mmdet.models.necks.fpn import FPN
+from ..builder import ROTATED_NECKS
 
 class FreqResidualModulation(nn.Module):
     """
