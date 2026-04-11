@@ -12,7 +12,7 @@ fi
 
 # 自动添加前缀路径
 CONFIG="configs/$1"
-WORK_DIR="runs/DOTA/$2"
+WORK_DIR="runs/$2"
 RESULT="$2"
 # 训练
 python tools/train.py "$CONFIG" --work-dir "$WORK_DIR" --no-validate
