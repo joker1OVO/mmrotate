@@ -103,18 +103,39 @@ class AngleFreqEnhanceFPN(FPN):
         laterals = []
         for i, lateral_conv in enumerate(self.lateral_convs):
             feat = lateral_conv(inputs[i + self.start_level])
-            laterals.append(feat)   # 注意：这里不再直接应用调制
+            laterals.append(feat)
 
         # 2. Top-down 融合，在相加前对高层上采样特征做频域残差调制
         used_backbone_levels = len(laterals)
         for i in range(used_backbone_levels - 1, 0, -1):
             prev_shape = laterals[i-1].shape[2:]
             upsampled = F.interpolate(laterals[i], size=prev_shape, **self.upsample_cfg)
-            # 关键：对高层上采样特征进行频域残差调制
-            upsampled = self.freq_mods[i](upsampled)   # 这里 i 对应高层层级
+            # 对高层上采样特征进行频域残差调制（i 对应高层索引）
+            upsampled = self.freq_mods[i](upsampled)
             laterals[i-1] = laterals[i-1] + upsampled
 
-        # 3. 后续输出层卷积等保持不变
+        # 3. 构建输出层（P2~P5）
         outs = [self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)]
-        # ... 额外层处理（与之前相同）
+
+        # 4. 处理额外的输出层（如 P6, P7）—— 必须保留父类的额外层逻辑
+        if self.num_outs > len(outs):
+            if not self.add_extra_convs:
+                for i in range(self.num_outs - used_backbone_levels):
+                    outs.append(F.max_pool2d(outs[-1], 1, stride=2))
+            else:
+                if self.add_extra_convs == 'on_input':
+                    extra_source = inputs[self.backbone_end_level - 1]
+                elif self.add_extra_convs == 'on_lateral':
+                    extra_source = laterals[-1]
+                elif self.add_extra_convs == 'on_output':
+                    extra_source = outs[-1]
+                else:
+                    raise NotImplementedError
+                outs.append(self.fpn_convs[used_backbone_levels](extra_source))
+                for i in range(used_backbone_levels + 1, self.num_outs):
+                    if self.relu_before_extra_convs:
+                        outs.append(self.fpn_convs[i](F.relu(outs[-1])))
+                    else:
+                        outs.append(self.fpn_convs[i](outs[-1]))
+
         return tuple(outs)
