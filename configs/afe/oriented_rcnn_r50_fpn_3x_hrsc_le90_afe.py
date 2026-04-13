@@ -18,15 +18,10 @@ model = dict(
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
-        type='FAAFusionFPN',
+        type='FPN',
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
-        num_outs=5,
-        fusion_modes=['add', 'add', 'faa'],  # P5→P4: add, P4→P3: add, P3→P2: faa
-        start_level=0,
-        end_level=-1,
-        add_extra_convs='on_input',
-        fam_cfg=dict(m=7, c_mid=64)),
+        num_outs=5),
     rpn_head=dict(
         type='OrientedRPNHead',
         in_channels=256,
@@ -58,11 +53,11 @@ model = dict(
             out_channels=256,
             featmap_strides=[4, 8, 16, 32]),
         bbox_head=dict(
-            type='FAAHead',
+            type='RotatedShared2FCBBoxHead',
             in_channels=256,
             fc_out_channels=1024,
             roi_feat_size=7,
-            num_classes=1,
+            num_classes=15,
             bbox_coder=dict(
                 type='DeltaXYWHAOBBoxCoder',
                 angle_range=angle_version,
@@ -159,11 +154,5 @@ data = dict(
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 
-optimizer = dict(
-    _delete_=True,
-    type='AdamW',
-    lr=0.0004,
-    betas=(0.9, 0.999),
-    weight_decay=0.05)
 
-evaluation = dict(interval=1, metric='mAP', start=31)
+evaluation = dict(interval=1, metric='mAP', start=33)
