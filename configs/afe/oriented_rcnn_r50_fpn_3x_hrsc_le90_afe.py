@@ -156,3 +156,4 @@ data = dict(
 
 
 evaluation = dict(interval=1, metric='mAP', start=33)
+optimizer = dict(lr=0.005)
