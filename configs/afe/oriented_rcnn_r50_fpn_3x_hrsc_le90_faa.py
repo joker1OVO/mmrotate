@@ -4,6 +4,7 @@ _base_ = [
 ]
 
 angle_version = 'le90'
+find_unused_parameters=True
 model = dict(
     type='OrientedRCNN',
     backbone=dict(
@@ -17,10 +18,15 @@ model = dict(
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
-        type='FPN',
+        type='FAAFusionFPN',
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
-        num_outs=5),
+        num_outs=5,
+        fusion_modes=['add', 'add', 'faa'],  # P5→P4: add, P4→P3: add, P3→P2: faa
+        start_level=0,
+        end_level=-1,
+        add_extra_convs='on_input',
+        fam_cfg=dict(m=7, c_mid=64)),
     rpn_head=dict(
         type='OrientedRPNHead',
         in_channels=256,
@@ -52,7 +58,7 @@ model = dict(
             out_channels=256,
             featmap_strides=[4, 8, 16, 32]),
         bbox_head=dict(
-            type='RotatedShared2FCBBoxHead',
+            type='FAAHead',
             in_channels=256,
             fc_out_channels=1024,
             roi_feat_size=7,
@@ -153,6 +159,11 @@ data = dict(
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 
+optimizer = dict(
+    _delete_=True,
+    type='AdamW',
+    lr=0.0004,
+    betas=(0.9, 0.999),
+    weight_decay=0.05)
 
-evaluation = dict(interval=1, metric='mAP', start=33)
-optimizer = dict(lr=0.005)
+evaluation = dict(interval=1, metric='mAP')
