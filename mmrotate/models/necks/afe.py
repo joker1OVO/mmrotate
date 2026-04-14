@@ -16,18 +16,19 @@ class FreqResidualModulation(nn.Module):
                  in_channels: int = 256,
                  c_mid: int = 16,           # 中间通道压缩数
                  kernel_size: int = 3,       # 残差预测器的卷积核大小
-                 use_tanh: bool = True):     # 是否用 Tanh 限制 ΔM 范围
+                 use_tanh: bool = True,      # 是否用 Tanh 限制 ΔM 范围
+                 scale: float = 0.1):        # 残差缩放因子，控制修改幅度
         super().__init__()
         self.in_channels = in_channels
         self.c_mid = c_mid
         self.use_tanh = use_tanh
+        self.scale = scale
 
         # 通道压缩与恢复
         self.proj_in = nn.Conv2d(in_channels, c_mid, kernel_size=1, bias=False)
         self.proj_out = nn.Conv2d(c_mid, in_channels, kernel_size=1, bias=False)
 
         # 残差预测器：一个小型 CNN，输入幅度谱，输出 ΔM
-        # 使用两个卷积层 + 激活，保持空间尺寸不变
         padding = kernel_size // 2
         self.res_predictor = nn.Sequential(
             nn.Conv2d(c_mid, c_mid, kernel_size, padding=padding, bias=False),
@@ -42,8 +43,8 @@ class FreqResidualModulation(nn.Module):
     @auto_fp16()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: [B, C, H, W] 输入特征图（通常是 FPN 中上采样后的高层特征）
-        返回: [B, C, H, W] 增强后的特征图（与 x 尺寸相同）
+        x: [B, C, H, W] 输入特征图
+        返回: [B, C, H, W] 增强后的特征图
         """
         B, C, H, W = x.shape
         device = x.device
@@ -54,16 +55,15 @@ class FreqResidualModulation(nn.Module):
         # 2. FFT 并中心化
         x_fft = torch.fft.fft2(x_proj, norm='ortho')
         x_fft_shift = torch.fft.fftshift(x_fft, dim=(-2, -1))
-        mag = x_fft_shift.abs()           # 幅度谱
+        mag = x_fft_shift.abs()           # 幅度谱，非负
         phase = x_fft_shift.angle()       # 相位谱
 
-        # 3. 预测残差幅度谱 ΔM
-        delta_mag = self.res_predictor(mag)   # [B, c_mid, H, W]
-        delta_mag = self.res_predictor(mag) * 0.1
+        # 3. 预测残差幅度谱 ΔM，并应用缩放因子
+        delta_mag = self.res_predictor(mag) * self.scale   # [B, c_mid, H, W]
 
-        # 4. 幅度谱残差加法
-        mag_enhanced = mag + delta_mag        # 可正可负，允许增强或抑制
-        mag_enhanced = torch.clamp(mag_enhanced, min=1e-6)
+        # 4. 幅度谱残差加法（允许正负），并保证非负
+        mag_enhanced = mag + delta_mag
+        mag_enhanced = torch.clamp(mag_enhanced, min=1e-6)  # 防止后续 log 或除零
 
         # 5. 重构复数频谱
         x_fft_shift_enhanced = mag_enhanced * torch.exp(1j * phase)
@@ -85,12 +85,13 @@ class AngleFreqEnhanceFPN(FPN):
                  in_channels,
                  out_channels,
                  num_outs,
-                 enhance_levels: List[int] = [0,1,2,3],
-                 afe_cfg: dict = dict(c_mid=16, kernel_size=3, use_tanh=True),
+                 enhance_levels: List[int] = [0, 1, 2, 3],
+                 afe_cfg: dict = dict(c_mid=16, kernel_size=3, use_tanh=True, scale=0.1),
                  **kwargs):
         super().__init__(in_channels, out_channels, num_outs, **kwargs)
         self.enhance_levels = enhance_levels
-        # 为每个层级构建独立的频域残差调制模块（只用在融合时）
+        # 注意：backbone 输出的特征层数为 len(in_channels)
+        # 这里为每个 backbone 输出层都构建一个调制器（未在 enhance_levels 中的使用 Identity）
         self.freq_mods = nn.ModuleList()
         for i in range(len(in_channels)):
             if i in enhance_levels:
@@ -109,17 +110,19 @@ class AngleFreqEnhanceFPN(FPN):
 
         # 2. Top-down 融合，在相加前对高层上采样特征做频域残差调制
         used_backbone_levels = len(laterals)
+        # 注意：laterals[i] 对应 backbone 的 i + self.start_level 层
         for i in range(used_backbone_levels - 1, 0, -1):
             prev_shape = laterals[i-1].shape[2:]
             upsampled = F.interpolate(laterals[i], size=prev_shape, **self.upsample_cfg)
-            # 对高层上采样特征进行频域残差调制（i 对应高层索引）
-            upsampled = self.freq_mods[i](upsampled)
+            # 关键修正：根据 backbone 的实际层级索引来获取对应的调制器
+            backbone_idx = i + self.start_level
+            upsampled = self.freq_mods[backbone_idx](upsampled)
             laterals[i-1] = laterals[i-1] + upsampled
 
-        # 3. 构建输出层（P2~P5）
+        # 3. 构建输出层（P2~P5 等）
         outs = [self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)]
 
-        # 4. 处理额外的输出层（如 P6, P7）—— 必须保留父类的额外层逻辑
+        # 4. 处理额外的输出层（如 P6, P7）—— 保留父类的额外层逻辑
         if self.num_outs > len(outs):
             if not self.add_extra_convs:
                 for i in range(self.num_outs - used_backbone_levels):
