@@ -20,18 +20,23 @@ model = dict(
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
         type='AngleFreqEnhanceFPN',
-        in_channels=[256, 512, 1024, 2048],
+        in_channels=[256, 512, 1024, 2048],  # ResNet50 的 4 个 stage 输出通道
         out_channels=256,
-        num_outs=5,
-        enhance_levels=[1, 2, 3],  # 对 P2~P5 的高层特征都进行调制
+        num_outs=5,  # 输出 P2~P6
+        enhance_levels=[0, 1, 2, 3],  # 对 P2, P3, P4, P5 都做 AFE 增强
         afe_cfg=dict(
-            c_mid=16,  # 压缩通道数
-            kernel_size=3,  # 残差预测器的卷积核大小
-            use_tanh=True,  # 限制 ΔM 在 [-1,1]
-            scale=0.3
+            n_angles=8,  # 角度划分数量（默认8，可调）
+            high_freq_ratio=0.3,  # 高频区域比例
+            learnable_weights=True,  # 角度权重可学习
+            enhance_init=1.0,  # 初始增强系数
+            residual=True,  # 残差连接
+            c_mid=16,  # 中间压缩通道数
+            eps=1e-8
         ),
-        start_level=0,
-        add_extra_convs='on_lateral',
+        start_level=0,  # 从 backbone 的 stage0 开始
+        add_extra_convs='on_lateral',  # 生成 P6 的方式
+        relu_before_extra_convs=True,  # 可选，与原始 FPN 保持一致
+        upsample_cfg=dict(mode='nearest')  # 上采样方式
     ),
     rpn_head=dict(
         type='OrientedRPNHead',
