@@ -1,3 +1,8 @@
+evaluation = dict(
+    interval=1,
+    metric='mAP',
+    save_best='mAP'  # 自动保存 best_mAP_epoch_xx.pth
+)
 # evaluation
 evaluation = dict(interval=36, metric='mAP')
 # optimizer
@@ -11,5 +16,7 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     step=[24, 33])
 runner = dict(type='EpochBasedRunner', max_epochs=36)
-checkpoint_config = dict(interval=36)
+checkpoint_config = dict(
+    interval=1,
+    max_keep_ckpts=4)
 
