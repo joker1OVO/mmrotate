@@ -110,23 +110,40 @@ class AngleFreqEnhanceFPN(FPN):
 
     @auto_fp16()
     def forward(self, inputs):
-        # 原始 FPN forward 逻辑，保持与父类一致
+        # 1. 侧向连接
         laterals = []
         for i, lateral_conv in enumerate(self.lateral_convs):
             feat = lateral_conv(inputs[i + self.start_level])
+            # 检查侧向卷积后的输出
+            if torch.isnan(feat).any() or torch.isinf(feat).any():
+                print(f"NaN/Inf detected in lateral_conv output for level {i}")
             laterals.append(feat)
 
+        # 2. Top-down 融合
         used_backbone_levels = len(laterals)
         for i in range(used_backbone_levels - 1, 0, -1):
-            prev_shape = laterals[i-1].shape[2:]
+            prev_shape = laterals[i - 1].shape[2:]
             upsampled = F.interpolate(laterals[i], size=prev_shape, **self.upsample_cfg)
             backbone_idx = i + self.start_level
-            # 关键：只对指定的层级进行调制
             if backbone_idx in self.enhance_levels:
+                # 检查进入频域模块前的 upsampled
+                if torch.isnan(upsampled).any() or torch.isinf(upsampled).any():
+                    print(f"NaN/Inf detected before freq_mod for level {backbone_idx}")
                 upsampled = self.freq_mods[backbone_idx](upsampled)
-            laterals[i-1] = laterals[i-1] + upsampled
+                # 检查频域模块输出
+                if torch.isnan(upsampled).any() or torch.isinf(upsampled).any():
+                    print(f"NaN/Inf detected after freq_mod for level {backbone_idx}")
+            laterals[i - 1] = laterals[i - 1] + upsampled
+            # 检查相加后的结果
+            if torch.isnan(laterals[i - 1]).any() or torch.isinf(laterals[i - 1]).any():
+                print(f"NaN/Inf detected after addition for level {i - 1}")
 
+        # 3. 构建输出
         outs = [self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)]
+        # 检查最终输出
+        for idx, out in enumerate(outs):
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                print(f"NaN/Inf detected in final out level {idx}")
 
         # 处理 extra convs (P6等)
         if self.num_outs > len(outs):
