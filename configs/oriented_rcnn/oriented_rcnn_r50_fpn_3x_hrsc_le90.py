@@ -11,8 +11,8 @@ model = dict(
         depth=50,
         num_stages=4,
         out_indices=(0, 1, 2, 3),
-        frozen_stages=-1,
-        norm_cfg=dict(type='BN', requires_grad=True),
+        frozen_stages=1,
+        norm_cfg=dict(type='BN', requires_grad=True),  # if more than one gpu, use SyncBN instead of BN
         norm_eval=True,
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
@@ -123,7 +123,7 @@ model = dict(
             max_per_img=2000)))
 
 img_norm_cfg = dict(
-    mean=[21.55, 21.55, 21.55], std=[24.42, 24.42, 24.42], to_rgb=True)
+    mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
 train_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='LoadAnnotations', with_bbox=True),
@@ -133,20 +133,26 @@ train_pipeline = [
         flip_ratio=[0.25, 0.25, 0.25],
         direction=['horizontal', 'vertical', 'diagonal'],
         version=angle_version),
+    dict(
+        type='PolyRandomRotate',
+        rotate_ratio=0.5,
+        angles_range=180,
+        auto_bound=False,
+        version=angle_version),
     dict(type='Normalize', **img_norm_cfg),
     dict(type='Pad', size_divisor=32),
     dict(type='DefaultFormatBundle'),
     dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels'])
 ]
+
+
 data = dict(
+    samples_per_gpu=2,
+    workers_per_gpu=2,
     train=dict(pipeline=train_pipeline, version=angle_version),
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 
 
-anchor_generator = dict(
-    scales=[32, 64, 128],  # 原始通常为[8,16,32]
-    ratios=[0.5, 1.0, 2.0],
-    strides=[4, 8, 16, 32, 64]
-)
-
+evaluation = dict(interval=1, metric='mAP', start=33)
+optimizer = dict(lr=0.005)
