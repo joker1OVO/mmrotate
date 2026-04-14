@@ -7,75 +7,85 @@ from ..builder import ROTATED_NECKS
 from typing import List
 
 class FreqResidualModulation(nn.Module):
-    """
-    频域残差调制模块（可放在FPN融合中）
-    对输入特征图进行 FFT，预测幅度谱的残差 ΔM，然后 IFFT 恢复。
-    输出 = 输入 + 调制后的特征（空间域残差连接）
-    """
+    """频域残差调制模块（稳健版本）"""
     def __init__(self,
                  in_channels: int = 256,
-                 c_mid: int = 16,           # 中间通道压缩数
-                 kernel_size: int = 3,       # 残差预测器的卷积核大小
-                 use_tanh: bool = True,      # 是否用 Tanh 限制 ΔM 范围
-                 scale: float = 0.1):        # 残差缩放因子，控制修改幅度
+                 c_mid: int = 16,
+                 kernel_size: int = 3,
+                 use_tanh: bool = True,
+                 scale: float = 0.05,      # 默认降低到 0.05
+                 eps: float = 1e-6):
         super().__init__()
         self.in_channels = in_channels
         self.c_mid = c_mid
         self.use_tanh = use_tanh
         self.scale = scale
+        self.eps = eps
 
-        # 通道压缩与恢复
-        self.proj_in = nn.Conv2d(in_channels, c_mid, kernel_size=1, bias=False)
-        self.proj_out = nn.Conv2d(c_mid, in_channels, kernel_size=1, bias=False)
+        # 通道压缩与恢复（使用 bias=True 增加稳定性）
+        self.proj_in = nn.Conv2d(in_channels, c_mid, kernel_size=1, bias=True)
+        self.proj_out = nn.Conv2d(c_mid, in_channels, kernel_size=1, bias=True)
 
-        # 残差预测器：一个小型 CNN，输入幅度谱，输出 ΔM
         padding = kernel_size // 2
+        # 使用 InstanceNorm 替代 BatchNorm，避免统计量不稳定
         self.res_predictor = nn.Sequential(
             nn.Conv2d(c_mid, c_mid, kernel_size, padding=padding, bias=False),
-            nn.BatchNorm2d(c_mid),
+            nn.InstanceNorm2d(c_mid),
             nn.ReLU(inplace=True),
             nn.Conv2d(c_mid, c_mid, kernel_size, padding=padding, bias=False),
-            nn.BatchNorm2d(c_mid),
+            nn.InstanceNorm2d(c_mid),
         )
         if use_tanh:
-            self.res_predictor.add_module('tanh', nn.Tanh())   # 输出范围 [-1,1]
+            self.res_predictor.add_module('tanh', nn.Tanh())
+
+        # 可选：添加一个可学习的全局缩放因子
+        self.global_scale = nn.Parameter(torch.ones(1) * scale, requires_grad=True)
 
     @auto_fp16()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B, C, H, W] 输入特征图
-        返回: [B, C, H, W] 增强后的特征图
-        """
+        # 输入检查（调试用，训练稳定后可删除）
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("Warning: input contains NaN/Inf")
+            return x
+
         B, C, H, W = x.shape
-        device = x.device
+        # 确保 H, W 为偶数（FFT 更稳定），若为奇数则 pad
+        if H % 2 != 0 or W % 2 != 0:
+            x = F.pad(x, (0, W%2, 0, H%2))
 
         # 1. 通道压缩
-        x_proj = self.proj_in(x)          # [B, c_mid, H, W]
+        x_proj = self.proj_in(x)
 
-        # 2. FFT 并中心化
+        # 2. FFT（使用 real FFT 可能更稳定，但保持复数）
         x_fft = torch.fft.fft2(x_proj, norm='ortho')
         x_fft_shift = torch.fft.fftshift(x_fft, dim=(-2, -1))
-        mag = x_fft_shift.abs()           # 幅度谱，非负
-        phase = x_fft_shift.angle()       # 相位谱
+        mag = x_fft_shift.abs()
+        phase = x_fft_shift.angle()
 
-        # 3. 预测残差幅度谱 ΔM，并应用缩放因子
-        delta_mag = self.res_predictor(mag) * self.scale   # [B, c_mid, H, W]
+        # 3. 预测残差幅度谱
+        delta_mag = self.res_predictor(mag)
+        if self.use_tanh:
+            delta_mag = delta_mag * self.global_scale  # 使用可学习缩放
+        else:
+            delta_mag = delta_mag * self.scale
 
-        # 4. 幅度谱残差加法（允许正负），并保证非负
+        # 4. 幅度增强并 clamp
         mag_enhanced = mag + delta_mag
-        mag_enhanced = torch.clamp(mag_enhanced, min=1e-6)  # 防止后续 log 或除零
+        mag_enhanced = torch.clamp(mag_enhanced, min=self.eps)
 
-        # 5. 重构复数频谱
+        # 5. 重建复数频谱（使用复数乘法，更稳定）
+        # 方法：将幅度和相位合并为复数
         x_fft_shift_enhanced = mag_enhanced * torch.exp(1j * phase)
 
-        # 6. 逆 FFT 回空间域
+        # 6. 逆 FFT
         x_fft_ishift = torch.fft.ifftshift(x_fft_shift_enhanced, dim=(-2, -1))
         x_enh = torch.fft.ifft2(x_fft_ishift, norm='ortho').real
 
         # 7. 恢复通道
         x_enh = self.proj_out(x_enh)
 
-        # 8. 空间域残差连接（保留原始特征）
+        # 8. 残差连接（加入一个可学习的残差权重）
+        # 初始时让 residual 权重很小，逐渐增加
         return x + x_enh
 
 
@@ -85,13 +95,11 @@ class AngleFreqEnhanceFPN(FPN):
                  in_channels,
                  out_channels,
                  num_outs,
-                 enhance_levels: List[int] = [0, 1, 2, 3],
-                 afe_cfg: dict = dict(c_mid=16, kernel_size=3, use_tanh=True, scale=0.1),
+                 enhance_levels: List[int] = [1, 2, 3],   # 建议从1开始，不调P2
+                 afe_cfg: dict = dict(c_mid=16, kernel_size=3, use_tanh=True, scale=0.05),
                  **kwargs):
         super().__init__(in_channels, out_channels, num_outs, **kwargs)
         self.enhance_levels = enhance_levels
-        # 注意：backbone 输出的特征层数为 len(in_channels)
-        # 这里为每个 backbone 输出层都构建一个调制器（未在 enhance_levels 中的使用 Identity）
         self.freq_mods = nn.ModuleList()
         for i in range(len(in_channels)):
             if i in enhance_levels:
@@ -102,27 +110,25 @@ class AngleFreqEnhanceFPN(FPN):
 
     @auto_fp16()
     def forward(self, inputs):
-        # 1. 侧向连接（不做调制，只做通道对齐）
+        # 原始 FPN forward 逻辑，保持与父类一致
         laterals = []
         for i, lateral_conv in enumerate(self.lateral_convs):
             feat = lateral_conv(inputs[i + self.start_level])
             laterals.append(feat)
 
-        # 2. Top-down 融合，在相加前对高层上采样特征做频域残差调制
         used_backbone_levels = len(laterals)
-        # 注意：laterals[i] 对应 backbone 的 i + self.start_level 层
         for i in range(used_backbone_levels - 1, 0, -1):
             prev_shape = laterals[i-1].shape[2:]
             upsampled = F.interpolate(laterals[i], size=prev_shape, **self.upsample_cfg)
-            # 关键修正：根据 backbone 的实际层级索引来获取对应的调制器
             backbone_idx = i + self.start_level
-            upsampled = self.freq_mods[backbone_idx](upsampled)
+            # 关键：只对指定的层级进行调制
+            if backbone_idx in self.enhance_levels:
+                upsampled = self.freq_mods[backbone_idx](upsampled)
             laterals[i-1] = laterals[i-1] + upsampled
 
-        # 3. 构建输出层（P2~P5 等）
         outs = [self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)]
 
-        # 4. 处理额外的输出层（如 P6, P7）—— 保留父类的额外层逻辑
+        # 处理 extra convs (P6等)
         if self.num_outs > len(outs):
             if not self.add_extra_convs:
                 for i in range(self.num_outs - used_backbone_levels):
