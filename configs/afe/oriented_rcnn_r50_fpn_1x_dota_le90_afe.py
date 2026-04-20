@@ -18,17 +18,14 @@ model = dict(
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
         type='AngleFreqEnhanceFPN',
-        in_channels=[256, 512, 1024, 2048],
+        in_channels=[256, 512, 1024, 2048],  # ResNet50 的 4 个 stage 输出通道
         out_channels=256,
         num_outs=5,
-        enhance_levels=[0, 1, 2, 3],  # 对 P2~P5 的高层特征都进行调制
-        afe_cfg=dict(
-            c_mid=16,  # 压缩通道数
-            kernel_size=3,  # 残差预测器的卷积核大小
-            use_tanh=True,  # 限制 ΔM 在 [-1,1]
-        ),
+        enhance_levels=[0, 1, 2, 3],
         start_level=0,
-        add_extra_convs='on_lateral',
+        end_level=-1,
+        add_extra_convs='on_input',  # 保持与原配置一致
+        fam_cfg=dict(m=7, eps=1e-8)
     ),
     rpn_head=dict(
         type='OrientedRPNHead',
