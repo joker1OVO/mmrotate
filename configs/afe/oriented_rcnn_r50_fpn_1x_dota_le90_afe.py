@@ -18,13 +18,14 @@ model = dict(
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
         type='AngleFreqEnhanceFPN',
-        in_channels=[256, 512, 1024, 2048],  # ResNet50 的 4 个 stage 输出通道
+        in_channels=[256, 512, 1024, 2048],
         out_channels=256,
         num_outs=5,
-        enhance_levels=[0, 1, 2, 3],
+        # 对应：P5->P4(add), P4->P3(add), P3->P2(afe)
+        fusion_modes=['afe', 'afe', 'afe'],
         start_level=0,
         end_level=-1,
-        add_extra_convs='on_input',  # 保持与原配置一致
+        add_extra_convs='on_input',
         fam_cfg=dict(m=7, eps=1e-8)
     ),
     rpn_head=dict(
