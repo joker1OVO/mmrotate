@@ -19,18 +19,14 @@ model = dict(
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
-        type='AngleFreqEnhanceFPN',  # 指向新定义的类名
-        in_channels=[256, 512, 1024, 2048],
+        type='AngleFreqEnhanceFPN',
+        in_channels=[256, 512, 1024, 2048],  # ResNet50 的 4 个 stage 输出通道
         out_channels=256,
         num_outs=5,
-        # 这里的 fusion_modes 决定了哪一层使用 AFE。
-        # 建议在低层（P2/P3）使用 'afe'，因为那里分辨率高且目标细节丰富。
-        # 例如：P5->P4 使用 add, P4->P3 使用 add, P3->P2 使用 afe
-        fusion_modes=['add', 'add', 'afe'],
+        enhance_levels=[0, 1, 2, 3],
         start_level=0,
         end_level=-1,
-        add_extra_convs='on_input',
-        # 根据 AFEModule 的 __init__ 参数设置
+        add_extra_convs='on_input',  # 保持与原配置一致
         fam_cfg=dict(m=7, eps=1e-8)
     ),
     rpn_head=dict(
