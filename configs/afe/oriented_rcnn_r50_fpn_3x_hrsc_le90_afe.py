@@ -24,7 +24,7 @@ model = dict(
         out_channels=256,
         num_outs=5,
         # 对应：P5->P4(add), P4->P3(add), P3->P2(afe)
-        fusion_modes=['add', 'afe', 'afe'],
+        fusion_modes=['add', 'add', 'afe'],
         start_level=0,
         end_level=-1,
         add_extra_convs='on_input',
@@ -141,12 +141,6 @@ train_pipeline = [
         type='RRandomFlip',
         flip_ratio=[0.25, 0.25, 0.25],
         direction=['horizontal', 'vertical', 'diagonal'],
-        version=angle_version),
-    dict(
-        type='PolyRandomRotate',
-        rotate_ratio=0.5,
-        angles_range=180,
-        auto_bound=False,
         version=angle_version),
     dict(type='Normalize', **img_norm_cfg),
     dict(type='Pad', size_divisor=32),

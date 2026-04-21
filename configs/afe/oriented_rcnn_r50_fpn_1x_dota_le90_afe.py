@@ -22,7 +22,7 @@ model = dict(
         out_channels=256,
         num_outs=5,
         # 对应：P5->P4(add), P4->P3(add), P3->P2(afe)
-        fusion_modes=['afe', 'afe', 'afe'],
+        fusion_modes=['add', 'add', 'afe'],
         start_level=0,
         end_level=-1,
         add_extra_convs='on_input',
