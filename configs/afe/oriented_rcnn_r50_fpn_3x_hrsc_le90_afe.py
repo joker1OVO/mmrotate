@@ -20,13 +20,15 @@ model = dict(
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
         type='AngleFreqEnhanceFPN',
-        in_channels=[256, 512, 1024, 2048],
+        in_channels=[256, 512, 1024, 2048],  # 对应 ResNet 的 C2~C5
         out_channels=256,
         num_outs=5,
-        fusion_modes=['afe', 'afe', 'afe'],  # P5->P4, P4->P3 用加法，P3->P2 用 AFE
+        fusion_modes=['add', 'add', 'afe'],  # P5->P4 add, P4->P3 add, P3->P2 afe
         start_level=0,
         end_level=-1,
-        add_extra_convs='on_input',
+        add_extra_convs='on_input',  # 保持与原 FPN 一致
+        relu_before_extra_convs=False,
+        upsample_cfg=dict(mode='nearest')
     ),
     rpn_head=dict(
         type='OrientedRPNHead',

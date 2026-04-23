@@ -1,4 +1,3 @@
-# mmrotate/models/necks/afe.py
 import math
 import torch
 import torch.nn as nn
@@ -8,21 +7,14 @@ from mmdet.models.necks.fpn import FPN
 from ..builder import ROTATED_NECKS
 from typing import List
 
-
-# ========== 辅助函数：批量估计角度（与 FAA 一致） ==========
+# ========== 批量角度估计（与 FAA 一致） ==========
 def estimate_main_direction_batch(patch_tensor, eps=1e-8):
-    """
-    批量估计每个 patch 的主轴方向 (输入: [B*N, 1, m, m])
-    返回: [B*N] 弧度 (0~pi)
-    """
     Bn, _, m, _ = patch_tensor.shape
     device = patch_tensor.device
-
     x_fft = torch.fft.fft2(patch_tensor.squeeze(1), norm='ortho')
     x_fft_shifted = torch.fft.fftshift(x_fft, dim=(-2, -1))
     mag = x_fft_shifted.abs() + eps
 
-    # 频率网格
     h_freq = torch.fft.fftfreq(m) * m
     w_freq = torch.fft.fftfreq(m) * m
     h_grid, w_grid = torch.meshgrid(h_freq, w_freq, indexing='ij')
@@ -46,18 +38,11 @@ def estimate_main_direction_batch(patch_tensor, eps=1e-8):
 
 
 def compute_angle_map(x, window_size=7):
-    """
-    输入特征图 x: [B, C, H, W]
-    输出角度图 angle_map: [B, H, W] 弧度 (0~pi)
-    通过滑动窗口 (stride=1, padding=window_size//2) 对每个位置估计方向
-    """
     B, C, H, W = x.shape
-    # 通道取均值以降低计算量
-    x_mean = x.mean(dim=1, keepdim=True)  # [B,1,H,W]
-    # 使用 unfold 提取所有窗口，步长=1，边缘补零 (padding)
+    x_mean = x.mean(dim=1, keepdim=True)
     pad = window_size // 2
     x_pad = F.pad(x_mean, (pad, pad, pad, pad), mode='reflect')
-    patches = F.unfold(x_pad, kernel_size=window_size, stride=1)  # [B, m*m, H*W]
+    patches = F.unfold(x_pad, kernel_size=window_size, stride=1)
     N = patches.shape[2]
     patches = patches.transpose(1, 2).reshape(B * N, 1, window_size, window_size)
     angles = estimate_main_direction_batch(patches)  # [B*N]
@@ -65,142 +50,129 @@ def compute_angle_map(x, window_size=7):
     return angle_map
 
 
-# ========== 动态方向卷积模块 ==========
 class DynamicDirectionalConv(nn.Module):
-    """
-    动态方向深度卷积：根据每个位置的预测角度（或权重）线性组合基础核，对输入特征进行 depthwise 卷积。
-    每个空间位置独立生成核（参数为 H×W×4 个标量）
-    """
-    def __init__(self, in_channels, kernel_size=7, stride=1, padding=3):
+    def __init__(self, in_channels, mid_channels=16, kernel_size=7, stride=1, padding=3):
         super().__init__()
         self.in_channels = in_channels
+        self.mid_channels = mid_channels
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
 
-        # 预定义4个基础核（0°,45°,90°,135°方向的各向异性高斯核）
+        # 通道降维与升维
+        self.reduce = nn.Conv2d(in_channels, mid_channels, 1, bias=False)
+        self.expand = nn.Conv2d(mid_channels, in_channels, 1, bias=False)
+
+        # 预定义4个基础核（0°,45°,90°,135°）
         base_kernels = self._create_base_kernels(kernel_size)  # [4, 1, K, K]
         self.register_buffer('base_kernels', base_kernels)
 
-        # 权重预测网络：输入角度（sin2θ, cos2θ），输出4个组合权重
+        # 权重预测网络：输入角度特征（sin2θ, cos2θ）
         self.weight_net = nn.Sequential(
             nn.Linear(2, 8),
             nn.ReLU(),
             nn.Linear(8, 4),
-            nn.Softmax(dim=-1)   # 权重和为1，保证数值稳定
+            nn.Softmax(dim=-1)
         )
 
     def _create_base_kernels(self, k):
-        """生成4个方向的各向异性高斯核（长轴σ1=2.5，短轴σ2=1.0）"""
         sigma1, sigma2 = 2.5, 1.0
         angles = [0, math.pi/4, math.pi/2, 3*math.pi/4]
         kernels = []
         for theta in angles:
-            kernel = self._gaussian_kernel(k, sigma1, sigma2, theta)
+            ax = torch.linspace(-(k//2), k//2, k)
+            xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+            x_rot = xx * math.cos(theta) + yy * math.sin(theta)
+            y_rot = -xx * math.sin(theta) + yy * math.cos(theta)
+            kernel = torch.exp(-(x_rot**2 / (2*sigma1**2) + y_rot**2 / (2*sigma2**2)))
+            kernel = kernel / kernel.sum()
             kernels.append(kernel)
-        return torch.stack(kernels, dim=0).unsqueeze(1)  # [4,1,k,k]
-
-    def _gaussian_kernel(self, size, sigma1, sigma2, theta):
-        """生成旋转的2D高斯核，长轴sigma1，短轴sigma2，方向theta"""
-        ax = torch.linspace(-(size//2), size//2, size)
-        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
-        x_rot = xx * math.cos(theta) + yy * math.sin(theta)
-        y_rot = -xx * math.sin(theta) + yy * math.cos(theta)
-        kernel = torch.exp(-(x_rot**2 / (2*sigma1**2) + y_rot**2 / (2*sigma2**2)))
-        kernel = kernel / kernel.sum()   # 归一化，使和为1
-        return kernel
+        return torch.stack(kernels, dim=0).unsqueeze(1)  # [4,1,K,K]
 
     def forward(self, x, angle_map):
         B, C, H, W = x.shape
         device = x.device
 
-        sin2 = torch.sin(2 * angle_map)
+        # 降维
+        x_low = self.reduce(x)               # [B, mid, H, W]
+        mid = self.mid_channels
+
+        # 生成角度特征
+        sin2 = torch.sin(2 * angle_map)      # [B, H, W]
         cos2 = torch.cos(2 * angle_map)
         angle_feat = torch.stack([sin2, cos2], dim=-1)  # [B, H, W, 2]
 
-        # 预测组合权重 [B, H, W, 4]
-        weights = self.weight_net(angle_feat)
+        # 预测组合权重
+        weights = self.weight_net(angle_feat)  # [B, H, W, 4]
 
-        # 基础核去掉通道维度: [4, K, K]
-        base_2d = self.base_kernels.squeeze(1)  # shape: [4, kernel_size, kernel_size]
-        # 线性组合: 求和下标 k (4个基础核)
-        combined = torch.einsum('bhwk,kij->bhwij', weights, base_2d)  # [B, H, W, K, K]
-        combined = combined.unsqueeze(3)  # [B, H, W, 1, K, K]
+        # 组合基础核 -> [B, H, W, K, K]
+        base = self.base_kernels.squeeze(1)    # [4, K, K]
+        combined = torch.einsum('bhwk,kij->bhwij', weights, base)  # [B, H, W, K, K]
 
-        # 填充输入
-        x_pad = F.pad(x, (self.padding, self.padding, self.padding, self.padding), mode='reflect')
-        # 提取所有滑动窗口
-        patches = F.unfold(x_pad, kernel_size=self.kernel_size, stride=self.stride)  # [B, C*K*K, N]
-        N = patches.shape[-1]  # = H*W
-        patches = patches.view(B, C, self.kernel_size * self.kernel_size, N)  # [B, C, K*K, N]
-        patches = patches.permute(0, 1, 3, 2)  # [B, C, N, K*K]
+        # 准备滑动窗口和核展平
+        x_pad = F.pad(x_low, (self.padding, self.padding, self.padding, self.padding), mode='reflect')
+        patches = F.unfold(x_pad, kernel_size=self.kernel_size, stride=self.stride)  # [B, mid*K*K, N]
+        N = patches.shape[-1]  # H*W
+        patches = patches.view(B, mid, self.kernel_size*self.kernel_size, N)  # [B, mid, 49, N]
+        patches = patches.permute(0, 1, 3, 2)  # [B, mid, N, 49]
 
-        # 将组合核展平
-        kernels_flat = combined.view(B, H * W, -1)  # [B, N, K*K]
+        kernels_flat = combined.view(B, H*W, -1)  # [B, N, 49]
 
-        # 深度卷积: 每个位置每个通道独立乘加
-        out = torch.einsum('bcnk,bnk->bcn', patches, kernels_flat)  # [B, C, N]
-        out = out.view(B, C, H, W)
+        # 动态深度卷积
+        out_low = torch.einsum('bcnk,bnk->bcn', patches, kernels_flat)  # [B, mid, N]
+        out_low = out_low.view(B, mid, H, W)
+
+        # 升维输出
+        out = self.expand(out_low)  # [B, C, H, W]
         return out
 
 
-# ========== 集成到 FPN 的 Neck ==========
 @ROTATED_NECKS.register_module()
 class AngleFreqEnhanceFPN(FPN):
-    """
-    使用动态方向卷积增强 FPN 的自上而下融合。
-    """
     def __init__(self,
                  in_channels,
                  out_channels,
                  num_outs,
                  fusion_modes: List[str],
                  **kwargs):
-        super(AngleFreqEnhanceFPN, self).__init__(
+        super().__init__(
             in_channels=in_channels,
             out_channels=out_channels,
             num_outs=num_outs,
             **kwargs)
 
         self.fusion_modes = fusion_modes
-        # 动态卷积模块列表
         self.dynamic_convs = nn.ModuleList()
         for mode in fusion_modes:
             if mode == 'afe':
-                self.dynamic_convs.append(DynamicDirectionalConv(out_channels))
+                self.dynamic_convs.append(DynamicDirectionalConv(out_channels, mid_channels=16))
             else:
                 self.dynamic_convs.append(None)
 
     @auto_fp16()
     def forward(self, inputs):
-        """inputs: backbone 输出 (list of tensor)"""
-        # 1. 横向连接
         laterals = [
             lateral_conv(inputs[i + self.start_level])
             for i, lateral_conv in enumerate(self.lateral_convs)
         ]
 
         used_backbone_levels = len(laterals)
-        # 2. 自上而下融合
         for i in range(used_backbone_levels - 1, 0, -1):
-            fusion_idx = used_backbone_levels - 1 - i   # 0,1,2...
+            fusion_idx = used_backbone_levels - 1 - i
             mode = self.fusion_modes[fusion_idx]
 
             if mode == 'afe':
-                # 对低层特征 laterals[i-1] 应用动态方向卷积
-                angle_map = compute_angle_map(laterals[i-1])   # 计算角度图
+                angle_map = compute_angle_map(laterals[i-1])
                 enhanced_low = self.dynamic_convs[fusion_idx](laterals[i-1], angle_map)
-                # 上采样高层特征并相加
                 up_high = F.interpolate(laterals[i], size=enhanced_low.shape[-2:], **self.upsample_cfg)
                 laterals[i-1] = enhanced_low + up_high
-            else:   # mode == 'add'
+            else:  # 'add'
                 up_high = F.interpolate(laterals[i], size=laterals[i-1].shape[-2:], **self.upsample_cfg)
                 laterals[i-1] = laterals[i-1] + up_high
 
-        # 3. 输出卷积
         outs = [self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)]
 
-        # 4. 生成额外输出层 (与原 FPN 相同)
+        # 额外层生成
         if self.num_outs > len(outs):
             if not self.add_extra_convs:
                 for i in range(self.num_outs - used_backbone_levels):
