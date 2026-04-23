@@ -63,69 +63,29 @@ class DynamicDirectionalConv(nn.Module):
         self.reduce = nn.Conv2d(in_channels, mid_channels, 1, bias=False)
         self.expand = nn.Conv2d(mid_channels, in_channels, 1, bias=False)
 
-        base_kernels = self._create_base_kernels(kernel_size)  # [4, 1, K, K]
-        self.register_buffer('base_kernels', base_kernels)
+        # 固定各向同性高斯核（不学习，不依赖角度）
+        self.register_buffer('fixed_kernel', self._create_isotropic_kernel(kernel_size))
 
-        self.weight_net = nn.Sequential(
-            nn.Linear(2, 8),
-            nn.ReLU(),
-            nn.Linear(8, 4),
-            nn.Softmax(dim=-1)
-        )
+    def _create_isotropic_kernel(self, k):
+        sigma = 1.0
+        ax = torch.linspace(-(k//2), k//2, k)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        kernel = torch.exp(-(xx**2 + yy**2) / (2*sigma**2))
+        kernel = kernel / kernel.sum()
+        return kernel.view(1, 1, k, k)   # [1,1,K,K]
 
-    def _create_base_kernels(self, k):
-        sigma1, sigma2 = 2.5, 1.0
-        angles = [0, math.pi/4, math.pi/2, 3*math.pi/4]
-        kernels = []
-        for theta in angles:
-            ax = torch.linspace(-(k//2), k//2, k)
-            xx, yy = torch.meshgrid(ax, ax, indexing='ij')
-            x_rot = xx * math.cos(theta) + yy * math.sin(theta)
-            y_rot = -xx * math.sin(theta) + yy * math.cos(theta)
-            kernel = torch.exp(-(x_rot**2 / (2*sigma1**2) + y_rot**2 / (2*sigma2**2)))
-            kernel = kernel / (kernel.sum() + EPS)
-            kernels.append(kernel)
-        return torch.stack(kernels, dim=0).unsqueeze(1)  # [4,1,K,K]
-
-    def forward(self, x, angle_map):
+    def forward(self, x, angle_map):   # angle_map ignored
         B, C, H, W = x.shape
-        device = x.device
-
-        # 清理输入
-        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        angle_map = torch.nan_to_num(angle_map, nan=0.0, posinf=math.pi, neginf=0.0)
-
-        x_low = self.reduce(x)  # [B, mid, H, W]
+        x_low = self.reduce(x)          # [B, mid, H, W]
         mid = self.mid_channels
 
-        sin2 = torch.sin(2 * angle_map)
-        cos2 = torch.cos(2 * angle_map)
-        angle_feat = torch.stack([sin2, cos2], dim=-1)  # [B,H,W,2]
+        # 将固定核扩展到匹配 mid 通道数（每个通道相同核）
+        kernel = self.fixed_kernel.expand(mid, 1, self.kernel_size, self.kernel_size)  # [mid,1,K,K]
 
-        weights = self.weight_net(angle_feat)  # [B,H,W,4]
-        weights = torch.nan_to_num(weights, nan=0.25, posinf=1.0, neginf=0.0)
+        # 深度卷积
+        out_low = F.conv2d(x_low, kernel, padding=self.padding, groups=mid)  # [B, mid, H, W]
 
-        base = self.base_kernels.squeeze(1)  # [4, K, K]
-        combined = torch.einsum('bhwk,kij->bhwij', weights, base)  # [B,H,W,K,K]
-        # 限制核的范围，防止数值爆炸
-        combined = torch.clamp(combined, min=0.0, max=1.0)
-        # 可选：重新归一化每个核，使和为1
-        combined = combined / (combined.sum(dim=(-2,-1), keepdim=True) + EPS)
-
-        x_pad = F.pad(x_low, (self.padding, self.padding, self.padding, self.padding), mode='reflect')
-        patches = F.unfold(x_pad, kernel_size=self.kernel_size, stride=self.stride)  # [B, mid*K*K, N]
-        N = patches.shape[-1]  # H*W
-        patches = patches.view(B, mid, self.kernel_size*self.kernel_size, N)  # [B, mid, 49, N]
-        patches = patches.permute(0, 1, 3, 2)  # [B, mid, N, 49]
-
-        kernels_flat = combined.view(B, H*W, -1)  # [B, N, 49]
-
-        out_low = torch.einsum('bcnk,bnk->bcn', patches, kernels_flat)  # [B, mid, N]
-        out_low = out_low.view(B, mid, H, W)
-        out_low = torch.nan_to_num(out_low, nan=0.0, posinf=0.0, neginf=0.0)
-
-        out = self.expand(out_low)
-        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        out = self.expand(out_low)       # [B, C, H, W]
         return out
 
 @ROTATED_NECKS.register_module()
@@ -164,7 +124,8 @@ class AngleFreqEnhanceFPN(FPN):
 
             if mode == 'afe':
                 # 计算角度图
-                angle_map = compute_angle_map(laterals[i-1])
+                # angle_map = compute_angle_map(laterals[i-1])
+                angle_map = torch.zeros_like(laterals[i - 1][:, 0:1])  # 占位
                 enhanced_low = self.dynamic_convs[fusion_idx](laterals[i-1], angle_map)
                 up_high = F.interpolate(laterals[i], size=enhanced_low.shape[-2:], **self.upsample_cfg)
                 laterals[i-1] = enhanced_low + up_high
