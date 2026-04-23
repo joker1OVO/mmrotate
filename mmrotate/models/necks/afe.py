@@ -124,8 +124,7 @@ class AngleFreqEnhanceFPN(FPN):
 
             if mode == 'afe':
                 # 计算角度图
-                # angle_map = compute_angle_map(laterals[i-1])
-                angle_map = torch.zeros_like(laterals[i - 1][:, 0:1])  # 占位
+                angle_map = compute_angle_map(laterals[i-1])
                 enhanced_low = self.dynamic_convs[fusion_idx](laterals[i-1], angle_map)
                 up_high = F.interpolate(laterals[i], size=enhanced_low.shape[-2:], **self.upsample_cfg)
                 laterals[i-1] = enhanced_low + up_high
