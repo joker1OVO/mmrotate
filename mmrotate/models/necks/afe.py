@@ -7,8 +7,9 @@ from mmdet.models.necks.fpn import FPN
 from ..builder import ROTATED_NECKS
 from typing import List
 
-# ========== 批量角度估计（与 FAA 一致） ==========
-def estimate_main_direction_batch(patch_tensor, eps=1e-8):
+EPS = 1e-8
+
+def estimate_main_direction_batch(patch_tensor, eps=EPS):
     Bn, _, m, _ = patch_tensor.shape
     device = patch_tensor.device
     x_fft = torch.fft.fft2(patch_tensor.squeeze(1), norm='ortho')
@@ -36,7 +37,6 @@ def estimate_main_direction_batch(patch_tensor, eps=1e-8):
     theta_e = theta_valid[max_idx]
     return theta_e % math.pi
 
-
 def compute_angle_map(x, window_size=7):
     B, C, H, W = x.shape
     x_mean = x.mean(dim=1, keepdim=True)
@@ -45,10 +45,11 @@ def compute_angle_map(x, window_size=7):
     patches = F.unfold(x_pad, kernel_size=window_size, stride=1)
     N = patches.shape[2]
     patches = patches.transpose(1, 2).reshape(B * N, 1, window_size, window_size)
-    angles = estimate_main_direction_batch(patches)  # [B*N]
+    angles = estimate_main_direction_batch(patches)
     angle_map = angles.view(B, H, W)
+    # 清理可能的NaN
+    angle_map = torch.nan_to_num(angle_map, nan=0.0, posinf=math.pi, neginf=0.0)
     return angle_map
-
 
 class DynamicDirectionalConv(nn.Module):
     def __init__(self, in_channels, mid_channels=16, kernel_size=7, stride=1, padding=3):
@@ -59,15 +60,12 @@ class DynamicDirectionalConv(nn.Module):
         self.stride = stride
         self.padding = padding
 
-        # 通道降维与升维
         self.reduce = nn.Conv2d(in_channels, mid_channels, 1, bias=False)
         self.expand = nn.Conv2d(mid_channels, in_channels, 1, bias=False)
 
-        # 预定义4个基础核（0°,45°,90°,135°）
         base_kernels = self._create_base_kernels(kernel_size)  # [4, 1, K, K]
         self.register_buffer('base_kernels', base_kernels)
 
-        # 权重预测网络：输入角度特征（sin2θ, cos2θ）
         self.weight_net = nn.Sequential(
             nn.Linear(2, 8),
             nn.ReLU(),
@@ -85,7 +83,7 @@ class DynamicDirectionalConv(nn.Module):
             x_rot = xx * math.cos(theta) + yy * math.sin(theta)
             y_rot = -xx * math.sin(theta) + yy * math.cos(theta)
             kernel = torch.exp(-(x_rot**2 / (2*sigma1**2) + y_rot**2 / (2*sigma2**2)))
-            kernel = kernel / kernel.sum()
+            kernel = kernel / (kernel.sum() + EPS)
             kernels.append(kernel)
         return torch.stack(kernels, dim=0).unsqueeze(1)  # [4,1,K,K]
 
@@ -93,23 +91,27 @@ class DynamicDirectionalConv(nn.Module):
         B, C, H, W = x.shape
         device = x.device
 
-        # 降维
-        x_low = self.reduce(x)               # [B, mid, H, W]
+        # 清理输入
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        angle_map = torch.nan_to_num(angle_map, nan=0.0, posinf=math.pi, neginf=0.0)
+
+        x_low = self.reduce(x)  # [B, mid, H, W]
         mid = self.mid_channels
 
-        # 生成角度特征
-        sin2 = torch.sin(2 * angle_map)      # [B, H, W]
+        sin2 = torch.sin(2 * angle_map)
         cos2 = torch.cos(2 * angle_map)
-        angle_feat = torch.stack([sin2, cos2], dim=-1)  # [B, H, W, 2]
+        angle_feat = torch.stack([sin2, cos2], dim=-1)  # [B,H,W,2]
 
-        # 预测组合权重
-        weights = self.weight_net(angle_feat)  # [B, H, W, 4]
+        weights = self.weight_net(angle_feat)  # [B,H,W,4]
+        weights = torch.nan_to_num(weights, nan=0.25, posinf=1.0, neginf=0.0)
 
-        # 组合基础核 -> [B, H, W, K, K]
-        base = self.base_kernels.squeeze(1)    # [4, K, K]
-        combined = torch.einsum('bhwk,kij->bhwij', weights, base)  # [B, H, W, K, K]
+        base = self.base_kernels.squeeze(1)  # [4, K, K]
+        combined = torch.einsum('bhwk,kij->bhwij', weights, base)  # [B,H,W,K,K]
+        # 限制核的范围，防止数值爆炸
+        combined = torch.clamp(combined, min=0.0, max=1.0)
+        # 可选：重新归一化每个核，使和为1
+        combined = combined / (combined.sum(dim=(-2,-1), keepdim=True) + EPS)
 
-        # 准备滑动窗口和核展平
         x_pad = F.pad(x_low, (self.padding, self.padding, self.padding, self.padding), mode='reflect')
         patches = F.unfold(x_pad, kernel_size=self.kernel_size, stride=self.stride)  # [B, mid*K*K, N]
         N = patches.shape[-1]  # H*W
@@ -118,14 +120,13 @@ class DynamicDirectionalConv(nn.Module):
 
         kernels_flat = combined.view(B, H*W, -1)  # [B, N, 49]
 
-        # 动态深度卷积
         out_low = torch.einsum('bcnk,bnk->bcn', patches, kernels_flat)  # [B, mid, N]
         out_low = out_low.view(B, mid, H, W)
+        out_low = torch.nan_to_num(out_low, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # 升维输出
-        out = self.expand(out_low)  # [B, C, H, W]
+        out = self.expand(out_low)
+        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
         return out
-
 
 @ROTATED_NECKS.register_module()
 class AngleFreqEnhanceFPN(FPN):
@@ -162,6 +163,7 @@ class AngleFreqEnhanceFPN(FPN):
             mode = self.fusion_modes[fusion_idx]
 
             if mode == 'afe':
+                # 计算角度图
                 angle_map = compute_angle_map(laterals[i-1])
                 enhanced_low = self.dynamic_convs[fusion_idx](laterals[i-1], angle_map)
                 up_high = F.interpolate(laterals[i], size=enhanced_low.shape[-2:], **self.upsample_cfg)
