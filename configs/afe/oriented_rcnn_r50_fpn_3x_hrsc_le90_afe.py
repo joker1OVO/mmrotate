@@ -23,12 +23,10 @@ model = dict(
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
         num_outs=5,
-        # 对应：P5->P4(add), P4->P3(add), P3->P2(afe)
-        fusion_modes=['add', 'add', 'afe'],
+        fusion_modes=['afe', 'afe', 'afe'],  # P5->P4, P4->P3 用加法，P3->P2 用 AFE
         start_level=0,
         end_level=-1,
         add_extra_convs='on_input',
-        fam_cfg=dict(m=7, eps=1e-8)
     ),
     rpn_head=dict(
         type='OrientedRPNHead',
