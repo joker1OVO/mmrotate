@@ -63,29 +63,58 @@ class DynamicDirectionalConv(nn.Module):
         self.reduce = nn.Conv2d(in_channels, mid_channels, 1, bias=False)
         self.expand = nn.Conv2d(mid_channels, in_channels, 1, bias=False)
 
-        # 固定各向同性高斯核（不学习，不依赖角度）
-        self.register_buffer('fixed_kernel', self._create_isotropic_kernel(kernel_size))
+        # 两个基础核：水平方向（0°）和垂直方向（90°）的高斯核
+        base_horiz = self._create_anisotropic_kernel(kernel_size, sigma_h=2.5, sigma_v=1.0, angle=0)
+        base_vert = self._create_anisotropic_kernel(kernel_size, sigma_h=2.5, sigma_v=1.0, angle=math.pi/2)
+        self.register_buffer('base_horiz', base_horiz)  # [1,1,K,K]
+        self.register_buffer('base_vert', base_vert)
 
-    def _create_isotropic_kernel(self, k):
-        sigma = 1.0
+    def _create_anisotropic_kernel(self, k, sigma_h, sigma_v, angle):
         ax = torch.linspace(-(k//2), k//2, k)
         xx, yy = torch.meshgrid(ax, ax, indexing='ij')
-        kernel = torch.exp(-(xx**2 + yy**2) / (2*sigma**2))
-        kernel = kernel / kernel.sum()
-        return kernel.view(1, 1, k, k)   # [1,1,K,K]
+        x_rot = xx * math.cos(angle) + yy * math.sin(angle)
+        y_rot = -xx * math.sin(angle) + yy * math.cos(angle)
+        kernel = torch.exp(-(x_rot**2 / (2*sigma_h**2) + y_rot**2 / (2*sigma_v**2)))
+        kernel = kernel / (kernel.sum() + 1e-8)
+        return kernel.unsqueeze(0).unsqueeze(0)  # [1,1,K,K]
 
-    def forward(self, x, angle_map):   # angle_map ignored
+    def forward(self, x, angle_map):
         B, C, H, W = x.shape
-        x_low = self.reduce(x)          # [B, mid, H, W]
+        device = x.device
+
+        # 降维
+        x_low = self.reduce(x)  # [B, mid, H, W]
         mid = self.mid_channels
 
-        # 将固定核扩展到匹配 mid 通道数（每个通道相同核）
-        kernel = self.fixed_kernel.expand(mid, 1, self.kernel_size, self.kernel_size)  # [mid,1,K,K]
+        # 计算权重：角度在 [0, π)，水平->垂直的权重系数
+        # 方法：令 w = cos(θ)^2，则水平核权重 = w，垂直核权重 = 1-w
+        theta = angle_map  # [B,H,W]
+        w_horiz = torch.cos(theta) ** 2   # [B,H,W]
+        w_vert = 1 - w_horiz
 
-        # 深度卷积
-        out_low = F.conv2d(x_low, kernel, padding=self.padding, groups=mid)  # [B, mid, H, W]
+        # 组合核：每个位置不同
+        # 扩展维度以便广播 [B, H, W, 1, 1, 1] 乘以基础核 [1,1,K,K]
+        w_horiz = w_horiz.view(B, H, W, 1, 1, 1)
+        w_vert = w_vert.view(B, H, W, 1, 1, 1)
+        combined = w_horiz * self.base_horiz + w_vert * self.base_vert  # [B, H, W, 1, K, K]
+        combined = combined.squeeze(3)  # [B, H, W, K, K]
 
-        out = self.expand(out_low)       # [B, C, H, W]
+        # 准备滑动窗口
+        x_pad = F.pad(x_low, (self.padding, self.padding, self.padding, self.padding), mode='reflect')
+        patches = F.unfold(x_pad, kernel_size=self.kernel_size, stride=self.stride)  # [B, mid*K*K, N]
+        N = patches.shape[-1]  # H*W
+        patches = patches.view(B, mid, self.kernel_size*self.kernel_size, N)  # [B, mid, 49, N]
+        patches = patches.permute(0, 1, 3, 2)  # [B, mid, N, 49]
+
+        kernels_flat = combined.view(B, H*W, -1)  # [B, N, 49]
+
+        # 深度卷积（每个位置每个通道独立）
+        out_low = torch.einsum('bcnk,bnk->bcn', patches, kernels_flat)  # [B, mid, N]
+        out_low = out_low.view(B, mid, H, W)
+        out_low = torch.nan_to_num(out_low)
+
+        out = self.expand(out_low)
+        out = torch.nan_to_num(out)
         return out
 
 @ROTATED_NECKS.register_module()
