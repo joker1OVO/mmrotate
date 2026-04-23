@@ -116,24 +116,30 @@ class DynamicDirectionalConv(nn.Module):
 
         sin2 = torch.sin(2 * angle_map)
         cos2 = torch.cos(2 * angle_map)
-        angle_feat = torch.stack([sin2, cos2], dim=-1)  # [B,H,W,2]
+        angle_feat = torch.stack([sin2, cos2], dim=-1)  # [B, H, W, 2]
 
-        weights = self.weight_net(angle_feat)  # [B,H,W,4]
+        # 预测组合权重 [B, H, W, 4]
+        weights = self.weight_net(angle_feat)
 
-        base = self.base_kernels  # [4, 1, K, K]
-        # 修正 einsum：用 'kchw' 代替 'kckl'，避免重复下标
-        combined = torch.einsum('bhwk,kchw->bhwchw', weights, base)  # [B,H,W,1,K,K]
-        combined = combined.squeeze(3)  # [B,H,W,K,K]
+        # 基础核去掉通道维度: [4, K, K]
+        base_2d = self.base_kernels.squeeze(1)  # shape: [4, kernel_size, kernel_size]
+        # 线性组合: 求和下标 k (4个基础核)
+        combined = torch.einsum('bhwk,kij->bhwij', weights, base_2d)  # [B, H, W, K, K]
+        combined = combined.unsqueeze(3)  # [B, H, W, 1, K, K]
 
+        # 填充输入
         x_pad = F.pad(x, (self.padding, self.padding, self.padding, self.padding), mode='reflect')
+        # 提取所有滑动窗口
         patches = F.unfold(x_pad, kernel_size=self.kernel_size, stride=self.stride)  # [B, C*K*K, N]
-        N = patches.shape[-1]
-        patches = patches.view(B, C, self.kernel_size * self.kernel_size, N)  # [B,C,49,N]
-        patches = patches.permute(0, 1, 3, 2)  # [B,C,N,49]
+        N = patches.shape[-1]  # = H*W
+        patches = patches.view(B, C, self.kernel_size * self.kernel_size, N)  # [B, C, K*K, N]
+        patches = patches.permute(0, 1, 3, 2)  # [B, C, N, K*K]
 
-        kernels_flat = combined.view(B, H * W, -1)  # [B, N, 49]
+        # 将组合核展平
+        kernels_flat = combined.view(B, H * W, -1)  # [B, N, K*K]
 
-        out = torch.einsum('bcnk,bnk->bcn', patches, kernels_flat)  # [B,C,N]
+        # 深度卷积: 每个位置每个通道独立乘加
+        out = torch.einsum('bcnk,bnk->bcn', patches, kernels_flat)  # [B, C, N]
         out = out.view(B, C, H, W)
         return out
 
