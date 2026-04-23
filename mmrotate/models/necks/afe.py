@@ -111,42 +111,29 @@ class DynamicDirectionalConv(nn.Module):
         return kernel
 
     def forward(self, x, angle_map):
-        """
-        x: [B, C, H, W]
-        angle_map: [B, H, W] 弧度 (0~pi)
-        输出: [B, C, H, W]
-        """
         B, C, H, W = x.shape
         device = x.device
 
-        # 1. 将角度转换为 sin/cos 特征 (使用2θ消除π周期性)
-        sin2 = torch.sin(2 * angle_map)   # [B,H,W]
+        sin2 = torch.sin(2 * angle_map)
         cos2 = torch.cos(2 * angle_map)
         angle_feat = torch.stack([sin2, cos2], dim=-1)  # [B,H,W,2]
 
-        # 2. 预测每个位置的组合权重 [B,H,W,4]
         weights = self.weight_net(angle_feat)  # [B,H,W,4]
 
-        # 3. 组合基础核 -> [B, H, W, 1, K, K]
-        base = self.base_kernels  # [4,1,K,K]
-        # 使用 einsum 进行线性组合
-        combined = torch.einsum('bhwk,kckl->bhwckl', weights, base)  # [B,H,W,1,K,K]
+        base = self.base_kernels  # [4, 1, K, K]
+        # 修正 einsum：用 'kchw' 代替 'kckl'，避免重复下标
+        combined = torch.einsum('bhwk,kchw->bhwchw', weights, base)  # [B,H,W,1,K,K]
         combined = combined.squeeze(3)  # [B,H,W,K,K]
 
-        # 4. 准备输入特征的空间块
         x_pad = F.pad(x, (self.padding, self.padding, self.padding, self.padding), mode='reflect')
-        # unfold: [B, C*K*K, N] where N = H*W (因为 stride=1)
-        patches = F.unfold(x_pad, kernel_size=self.kernel_size, stride=self.stride)
-        N = patches.shape[-1]   # = H*W
-        patches = patches.view(B, C, self.kernel_size*self.kernel_size, N)  # [B, C, 49, N]
-        # 转置为 [B, C, N, 49]
-        patches = patches.permute(0,1,3,2)
+        patches = F.unfold(x_pad, kernel_size=self.kernel_size, stride=self.stride)  # [B, C*K*K, N]
+        N = patches.shape[-1]
+        patches = patches.view(B, C, self.kernel_size * self.kernel_size, N)  # [B,C,49,N]
+        patches = patches.permute(0, 1, 3, 2)  # [B,C,N,49]
 
-        # 5. 将核展平 [B, H, W, K*K] -> [B, N, 49]
-        kernels_flat = combined.view(B, H*W, -1)  # [B, N, 49]
+        kernels_flat = combined.view(B, H * W, -1)  # [B, N, 49]
 
-        # 6. 逐元素乘加: out[b,c,n] = sum_k patches[b,c,n,k] * kernels_flat[b,n,k]
-        out = torch.einsum('bcnk,bnk->bcn', patches, kernels_flat)  # [B, C, N]
+        out = torch.einsum('bcnk,bnk->bcn', patches, kernels_flat)  # [B,C,N]
         out = out.view(B, C, H, W)
         return out
 
