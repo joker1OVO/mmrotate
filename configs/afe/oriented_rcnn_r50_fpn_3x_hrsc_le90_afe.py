@@ -25,7 +25,7 @@ model = dict(
         num_outs=5,  # 重要：必须与 anchor_generator.strides 长度一致
         enhance_levels=None,  # 可选，不提供则对所有侧向层增强
         afe_cfg=dict(
-            c_mid=256,
+            c_mid=64,
             n_angles=12,  # 12个扇区，每15°
             radius_width=8,
             overlap_ratio=1.5,  # 轻度重叠
@@ -170,6 +170,12 @@ data = dict(
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 
+optimizer = dict(
+    _delete_=True,
+    type='AdamW',
+    lr=0.0004,
+    betas=(0.9, 0.999),
+    weight_decay=0.05)
 
-evaluation = dict(interval=1, metric='mAP', start=33)
-optimizer = dict(lr=0.005)
+evaluation = dict(interval=1, metric='mAP', start=1)
+# optimizer = dict(lr=0.005)

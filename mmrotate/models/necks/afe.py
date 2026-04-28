@@ -1,4 +1,3 @@
-# angle_freq_enhance.py
 import math
 import torch
 import torch.nn as nn
@@ -10,8 +9,7 @@ from typing import List, Optional
 
 
 class AngleFreqEnhance(nn.Module):
-    """频域极坐标增强模块：均匀半径分区 + 重叠角度扇区 + 通道独立可学习权重"""
-
+    """频域角度增强模块（静态卷积层版本，兼容 FLOPs 计算）"""
     def __init__(self,
                  in_channels: int = 256,
                  c_mid: int = 16,
@@ -32,32 +30,32 @@ class AngleFreqEnhance(nn.Module):
         self.use_hann_window = use_hann_window
         self.eps = eps
 
-        self.proj_in = None
-        self.proj_out = None
+        # ============ 静态创建卷积层（关键修改）============
+        self.proj_in = nn.Conv2d(in_channels, c_mid, kernel_size=1, bias=False)
+        self.proj_out = nn.Conv2d(c_mid, in_channels, kernel_size=1, bias=False)
+        nn.init.kaiming_normal_(self.proj_in.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.kaiming_normal_(self.proj_out.weight, mode='fan_out', nonlinearity='relu')
 
         if learnable_weights:
             self.weights = nn.Parameter(torch.ones(c_mid, n_angles, 1))
         else:
             self.register_buffer('weights', torch.ones(c_mid, n_angles, 1))
 
+        # 缓冲区，用于缓存半径索引和角度权重（与特征图尺寸相关）
         self.register_buffer('radius_idx', None)
         self.register_buffer('angle_weights', None)
         self.register_buffer('_hann_window', None)
         self._cached_HW = None
         self._cached_n_radii = None
 
-    def _build_proj(self, in_ch: int, device: torch.device):
-        self.proj_in = nn.Conv2d(in_ch, self.c_mid, kernel_size=1, bias=False).to(device)
-        self.proj_out = nn.Conv2d(self.c_mid, in_ch, kernel_size=1, bias=False).to(device)
-        nn.init.kaiming_normal_(self.proj_in.weight, mode='fan_out', nonlinearity='relu')
-        nn.init.kaiming_normal_(self.proj_out.weight, mode='fan_out', nonlinearity='relu')
-
     def _build_masks(self, H: int, W: int, device: torch.device):
+        """生成半径索引和角度软分配权重（与之前相同）"""
         cy, cx = H // 2, W // 2
         y, x = torch.meshgrid(torch.arange(H, device=device),
                               torch.arange(W, device=device), indexing='ij')
         r = torch.sqrt((y - cy) ** 2 + (x - cx) ** 2)
         theta = torch.atan2(y - cy, x - cx) + math.pi
+
         max_r = max(cy, cx)
         n_radii = int(max_r // self.radius_width) + 1
         radius_idx = torch.floor(r / self.radius_width).long().clamp(0, n_radii - 1)
@@ -75,11 +73,12 @@ class AngleFreqEnhance(nn.Module):
         sum_w = angle_weights.sum(dim=0, keepdim=True) + self.eps
         angle_weights = angle_weights / sum_w
 
-        self.radius_idx = radius_idx.unsqueeze(0).unsqueeze(0)
-        self.angle_weights = angle_weights.unsqueeze(0)
+        self.radius_idx = radius_idx.unsqueeze(0).unsqueeze(0)   # [1,1,H,W]
+        self.angle_weights = angle_weights.unsqueeze(0)         # [1, n_angles, H, W]
         self._cached_HW = (H, W)
         self._cached_n_radii = n_radii
 
+        # 调整可学习权重的维度（如果半径数变化）
         if hasattr(self, 'weights') and self.weights is not None:
             if self.weights.size(-1) != n_radii:
                 new_weights = torch.ones(self.c_mid, self.n_angles, n_radii, device=device)
@@ -87,11 +86,6 @@ class AngleFreqEnhance(nn.Module):
                     self.weights = nn.Parameter(new_weights)
                 else:
                     self.weights = new_weights
-            else:
-                if isinstance(self.weights, nn.Parameter):
-                    self.weights.data = self.weights.data.to(device)
-                else:
-                    self.weights = self.weights.to(device)
 
         if self.use_hann_window and self._hann_window is None:
             hann_h = torch.hann_window(H, device=device)
@@ -103,31 +97,29 @@ class AngleFreqEnhance(nn.Module):
         B, C, H, W = x.shape
         device = x.device
 
-        if self.proj_in is None:
-            self._build_proj(C, device)
+        # 静态卷积层，直接使用
+        x_proj = self.proj_in(x)   # [B, c_mid, H, W]
 
-        if self.proj_in.weight.device != device:
-            self.proj_in.to(device)
-            self.proj_out.to(device)
-
-        x_proj = self.proj_in(x)
-
+        # 可选加窗
         if self.use_hann_window:
             if self._hann_window is None or self._hann_window.shape[-2:] != (H, W):
                 self._build_masks(H, W, device)
             x_proj = x_proj * self._hann_window
 
+        # FFT
         x_fft = torch.fft.fft2(x_proj, norm='ortho')
         x_fft_shift = torch.fft.fftshift(x_fft, dim=(-2, -1))
         mag = x_fft_shift.abs() + self.eps
 
+        # 构建掩码
         if self._cached_HW != (H, W):
             self._build_masks(H, W, device)
 
-        r_idx = self.radius_idx.expand(B, -1, H, W)
-        aw = self.angle_weights.expand(B, -1, -1, -1)
+        r_idx = self.radius_idx.expand(B, -1, H, W)   # [B,1,H,W]
+        aw = self.angle_weights.expand(B, -1, -1, -1) # [B, n_angles, H, W]
         n_radii = self._cached_n_radii
 
+        # 确保 weights 在正确设备
         if hasattr(self, 'weights') and self.weights.device != device:
             if isinstance(self.weights, nn.Parameter):
                 self.weights.data = self.weights.data.to(device)
@@ -136,11 +128,11 @@ class AngleFreqEnhance(nn.Module):
 
         gain = torch.zeros(B, self.c_mid, H, W, device=device)
         for c in range(self.c_mid):
-            w_c = self.weights[c]
+            w_c = self.weights[c]  # [n_angles, n_radii]
             gain_c = torch.zeros(B, H, W, device=device)
             for r in range(n_radii):
-                mask_r = (r_idx == r).float()
-                w_r = w_c[:, r]
+                mask_r = (r_idx == r).float()  # [B,1,H,W]
+                w_r = w_c[:, r]               # [n_angles]
                 weighted_angles = aw * w_r.view(1, -1, 1, 1)
                 angle_sum = weighted_angles.sum(dim=1)
                 gain_c += angle_sum * mask_r.squeeze(1)
