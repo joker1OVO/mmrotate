@@ -1,3 +1,4 @@
+# angle_freq_enhance.py
 import math
 import torch
 import torch.nn as nn
@@ -5,117 +6,158 @@ import torch.nn.functional as F
 from mmcv.runner import auto_fp16
 from mmdet.models.necks.fpn import FPN
 from ..builder import ROTATED_NECKS
-from typing import List
+from typing import List, Optional
 
-EPS = 1e-8
 
-def estimate_main_direction_batch(patch_tensor, eps=EPS):
-    Bn, _, m, _ = patch_tensor.shape
-    device = patch_tensor.device
-    x_fft = torch.fft.fft2(patch_tensor.squeeze(1), norm='ortho')
-    x_fft_shifted = torch.fft.fftshift(x_fft, dim=(-2, -1))
-    mag = x_fft_shifted.abs() + eps
+class AngleFreqEnhance(nn.Module):
+    """频域极坐标增强模块：均匀半径分区 + 重叠角度扇区 + 通道独立可学习权重"""
 
-    h_freq = torch.fft.fftfreq(m) * m
-    w_freq = torch.fft.fftfreq(m) * m
-    h_grid, w_grid = torch.meshgrid(h_freq, w_freq, indexing='ij')
-    h_grid = torch.fft.fftshift(h_grid).to(device)
-    w_grid = torch.fft.fftshift(w_grid).to(device)
-
-    rho = torch.sqrt(h_grid ** 2 + w_grid ** 2)
-    theta = torch.atan2(h_grid, w_grid)
-    theta = (theta + 2 * math.pi) % (2 * math.pi)
-
-    mask = rho > eps
-    rho_valid = rho[mask]
-    theta_valid = theta[mask]
-
-    mag_flat = mag.view(Bn, -1)
-    mag_valid = mag_flat[:, mask.view(-1)]
-    weighted_energy = mag_valid * rho_valid.unsqueeze(0)
-    max_idx = torch.argmax(weighted_energy, dim=1)
-    theta_e = theta_valid[max_idx]
-    return theta_e % math.pi
-
-def compute_angle_map(x, window_size=7):
-    B, C, H, W = x.shape
-    x_mean = x.mean(dim=1, keepdim=True)
-    pad = window_size // 2
-    x_pad = F.pad(x_mean, (pad, pad, pad, pad), mode='reflect')
-    patches = F.unfold(x_pad, kernel_size=window_size, stride=1)
-    N = patches.shape[2]
-    patches = patches.transpose(1, 2).reshape(B * N, 1, window_size, window_size)
-    angles = estimate_main_direction_batch(patches)
-    angle_map = angles.view(B, H, W)
-    # 清理可能的NaN
-    angle_map = torch.nan_to_num(angle_map, nan=0.0, posinf=math.pi, neginf=0.0)
-    return angle_map
-
-class DynamicDirectionalConv(nn.Module):
-    def __init__(self, in_channels, mid_channels=16, kernel_size=7, stride=1, padding=3):
+    def __init__(self,
+                 in_channels: int = 256,
+                 c_mid: int = 16,
+                 n_angles: int = 8,
+                 radius_width: int = 8,
+                 overlap_ratio: float = 1.5,
+                 learnable_weights: bool = True,
+                 residual: bool = True,
+                 use_hann_window: bool = False,
+                 eps: float = 1e-8):
         super().__init__()
         self.in_channels = in_channels
-        self.mid_channels = mid_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
+        self.c_mid = c_mid
+        self.n_angles = n_angles
+        self.radius_width = radius_width
+        self.overlap_ratio = overlap_ratio
+        self.residual = residual
+        self.use_hann_window = use_hann_window
+        self.eps = eps
 
-        self.reduce = nn.Conv2d(in_channels, mid_channels, 1, bias=False)
-        self.expand = nn.Conv2d(mid_channels, in_channels, 1, bias=False)
+        self.proj_in = None
+        self.proj_out = None
 
-        # 两个基础核：水平方向（0°）和垂直方向（90°）的高斯核
-        base_horiz = self._create_anisotropic_kernel(kernel_size, sigma_h=2.5, sigma_v=1.0, angle=0)
-        base_vert = self._create_anisotropic_kernel(kernel_size, sigma_h=2.5, sigma_v=1.0, angle=math.pi/2)
-        self.register_buffer('base_horiz', base_horiz)  # [1,1,K,K]
-        self.register_buffer('base_vert', base_vert)
+        if learnable_weights:
+            self.weights = nn.Parameter(torch.ones(c_mid, n_angles, 1))
+        else:
+            self.register_buffer('weights', torch.ones(c_mid, n_angles, 1))
 
-    def _create_anisotropic_kernel(self, k, sigma_h, sigma_v, angle):
-        ax = torch.linspace(-(k//2), k//2, k)
-        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
-        x_rot = xx * math.cos(angle) + yy * math.sin(angle)
-        y_rot = -xx * math.sin(angle) + yy * math.cos(angle)
-        kernel = torch.exp(-(x_rot**2 / (2*sigma_h**2) + y_rot**2 / (2*sigma_v**2)))
-        kernel = kernel / (kernel.sum() + 1e-8)
-        return kernel.unsqueeze(0).unsqueeze(0)  # [1,1,K,K]
+        self.register_buffer('radius_idx', None)
+        self.register_buffer('angle_weights', None)
+        self.register_buffer('_hann_window', None)
+        self._cached_HW = None
+        self._cached_n_radii = None
 
-    def forward(self, x, angle_map):
+    def _build_proj(self, in_ch: int, device: torch.device):
+        self.proj_in = nn.Conv2d(in_ch, self.c_mid, kernel_size=1, bias=False).to(device)
+        self.proj_out = nn.Conv2d(self.c_mid, in_ch, kernel_size=1, bias=False).to(device)
+        nn.init.kaiming_normal_(self.proj_in.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.kaiming_normal_(self.proj_out.weight, mode='fan_out', nonlinearity='relu')
+
+    def _build_masks(self, H: int, W: int, device: torch.device):
+        cy, cx = H // 2, W // 2
+        y, x = torch.meshgrid(torch.arange(H, device=device),
+                              torch.arange(W, device=device), indexing='ij')
+        r = torch.sqrt((y - cy) ** 2 + (x - cx) ** 2)
+        theta = torch.atan2(y - cy, x - cx) + math.pi
+        max_r = max(cy, cx)
+        n_radii = int(max_r // self.radius_width) + 1
+        radius_idx = torch.floor(r / self.radius_width).long().clamp(0, n_radii - 1)
+
+        theta = theta % math.pi
+        delta = math.pi / self.n_angles
+        half_width = self.overlap_ratio * delta / 2.0
+        angle_weights = torch.zeros(self.n_angles, H, W, device=device)
+        for a in range(self.n_angles):
+            center = a * delta + delta / 2.0
+            dist = (theta - center).abs()
+            mask = dist < half_width
+            w = (1 - dist / half_width).clamp(min=0)
+            angle_weights[a] = w * mask.float()
+        sum_w = angle_weights.sum(dim=0, keepdim=True) + self.eps
+        angle_weights = angle_weights / sum_w
+
+        self.radius_idx = radius_idx.unsqueeze(0).unsqueeze(0)
+        self.angle_weights = angle_weights.unsqueeze(0)
+        self._cached_HW = (H, W)
+        self._cached_n_radii = n_radii
+
+        if hasattr(self, 'weights') and self.weights is not None:
+            if self.weights.size(-1) != n_radii:
+                new_weights = torch.ones(self.c_mid, self.n_angles, n_radii, device=device)
+                if isinstance(self.weights, nn.Parameter):
+                    self.weights = nn.Parameter(new_weights)
+                else:
+                    self.weights = new_weights
+            else:
+                if isinstance(self.weights, nn.Parameter):
+                    self.weights.data = self.weights.data.to(device)
+                else:
+                    self.weights = self.weights.to(device)
+
+        if self.use_hann_window and self._hann_window is None:
+            hann_h = torch.hann_window(H, device=device)
+            hann_w = torch.hann_window(W, device=device)
+            hann_2d = hann_h.unsqueeze(1) * hann_w.unsqueeze(0)
+            self._hann_window = hann_2d.unsqueeze(0).unsqueeze(0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         device = x.device
 
-        # 降维
-        x_low = self.reduce(x)  # [B, mid, H, W]
-        mid = self.mid_channels
+        if self.proj_in is None:
+            self._build_proj(C, device)
 
-        # 计算权重：角度在 [0, π)，水平->垂直的权重系数
-        # 方法：令 w = cos(θ)^2，则水平核权重 = w，垂直核权重 = 1-w
-        theta = angle_map  # [B,H,W]
-        w_horiz = torch.cos(theta) ** 2   # [B,H,W]
-        w_vert = 1 - w_horiz
+        if self.proj_in.weight.device != device:
+            self.proj_in.to(device)
+            self.proj_out.to(device)
 
-        # 组合核：每个位置不同
-        # 扩展维度以便广播 [B, H, W, 1, 1, 1] 乘以基础核 [1,1,K,K]
-        w_horiz = w_horiz.view(B, H, W, 1, 1, 1)
-        w_vert = w_vert.view(B, H, W, 1, 1, 1)
-        combined = w_horiz * self.base_horiz + w_vert * self.base_vert  # [B, H, W, 1, K, K]
-        combined = combined.squeeze(3)  # [B, H, W, K, K]
+        x_proj = self.proj_in(x)
 
-        # 准备滑动窗口
-        x_pad = F.pad(x_low, (self.padding, self.padding, self.padding, self.padding), mode='reflect')
-        patches = F.unfold(x_pad, kernel_size=self.kernel_size, stride=self.stride)  # [B, mid*K*K, N]
-        N = patches.shape[-1]  # H*W
-        patches = patches.view(B, mid, self.kernel_size*self.kernel_size, N)  # [B, mid, 49, N]
-        patches = patches.permute(0, 1, 3, 2)  # [B, mid, N, 49]
+        if self.use_hann_window:
+            if self._hann_window is None or self._hann_window.shape[-2:] != (H, W):
+                self._build_masks(H, W, device)
+            x_proj = x_proj * self._hann_window
 
-        kernels_flat = combined.view(B, H*W, -1)  # [B, N, 49]
+        x_fft = torch.fft.fft2(x_proj, norm='ortho')
+        x_fft_shift = torch.fft.fftshift(x_fft, dim=(-2, -1))
+        mag = x_fft_shift.abs() + self.eps
 
-        # 深度卷积（每个位置每个通道独立）
-        out_low = torch.einsum('bcnk,bnk->bcn', patches, kernels_flat)  # [B, mid, N]
-        out_low = out_low.view(B, mid, H, W)
-        out_low = torch.nan_to_num(out_low)
+        if self._cached_HW != (H, W):
+            self._build_masks(H, W, device)
 
-        out = self.expand(out_low)
-        out = torch.nan_to_num(out)
-        return out
+        r_idx = self.radius_idx.expand(B, -1, H, W)
+        aw = self.angle_weights.expand(B, -1, -1, -1)
+        n_radii = self._cached_n_radii
+
+        if hasattr(self, 'weights') and self.weights.device != device:
+            if isinstance(self.weights, nn.Parameter):
+                self.weights.data = self.weights.data.to(device)
+            else:
+                self.weights = self.weights.to(device)
+
+        gain = torch.zeros(B, self.c_mid, H, W, device=device)
+        for c in range(self.c_mid):
+            w_c = self.weights[c]
+            gain_c = torch.zeros(B, H, W, device=device)
+            for r in range(n_radii):
+                mask_r = (r_idx == r).float()
+                w_r = w_c[:, r]
+                weighted_angles = aw * w_r.view(1, -1, 1, 1)
+                angle_sum = weighted_angles.sum(dim=1)
+                gain_c += angle_sum * mask_r.squeeze(1)
+            gain[:, c, :, :] = gain_c
+
+        mag_enhanced = mag * gain
+        x_fft_shift_enhanced = mag_enhanced * torch.exp(1j * torch.angle(x_fft_shift))
+
+        x_fft_ishift = torch.fft.ifftshift(x_fft_shift_enhanced, dim=(-2, -1))
+        x_enh = torch.fft.ifft2(x_fft_ishift, norm='ortho').real
+        x_enh = self.proj_out(x_enh)
+
+        if self.residual:
+            return x + x_enh
+        else:
+            return x_enh
+
 
 @ROTATED_NECKS.register_module()
 class AngleFreqEnhanceFPN(FPN):
@@ -123,7 +165,10 @@ class AngleFreqEnhanceFPN(FPN):
                  in_channels,
                  out_channels,
                  num_outs,
-                 fusion_modes: List[str],
+                 enhance_levels: Optional[List[int]] = None,
+                 afe_cfg: dict = dict(
+                     c_mid=16, n_angles=8, radius_width=8, overlap_ratio=1.5,
+                     learnable_weights=True, residual=True, use_hann_window=False),
                  **kwargs):
         super().__init__(
             in_channels=in_channels,
@@ -131,39 +176,35 @@ class AngleFreqEnhanceFPN(FPN):
             num_outs=num_outs,
             **kwargs)
 
-        self.fusion_modes = fusion_modes
-        self.dynamic_convs = nn.ModuleList()
-        for mode in fusion_modes:
-            if mode == 'afe':
-                self.dynamic_convs.append(DynamicDirectionalConv(out_channels, mid_channels=16))
+        # 侧向层的数量（lateral_convs）由父类根据 start_level 和 in_channels 计算得出
+        num_lateral = len(self.lateral_convs)
+        self.afe_modules = nn.ModuleList()
+        for i in range(num_lateral):
+            if enhance_levels is not None and i not in enhance_levels:
+                self.afe_modules.append(nn.Identity())
             else:
-                self.dynamic_convs.append(None)
+                self.afe_modules.append(AngleFreqEnhance(in_channels=out_channels, **afe_cfg))
 
     @auto_fp16()
     def forward(self, inputs):
-        laterals = [
-            lateral_conv(inputs[i + self.start_level])
-            for i, lateral_conv in enumerate(self.lateral_convs)
-        ]
+        # 侧向连接 + 频域增强
+        laterals = []
+        for i, lateral_conv in enumerate(self.lateral_convs):
+            feat = lateral_conv(inputs[i + self.start_level])
+            feat = self.afe_modules[i](feat)
+            laterals.append(feat)
 
+        # 自顶向下融合（与原始 FPN 相同）
         used_backbone_levels = len(laterals)
         for i in range(used_backbone_levels - 1, 0, -1):
-            fusion_idx = used_backbone_levels - 1 - i
-            mode = self.fusion_modes[fusion_idx]
+            prev_shape = laterals[i - 1].shape[2:]
+            upsampled = F.interpolate(laterals[i], size=prev_shape, **self.upsample_cfg)
+            laterals[i - 1] = laterals[i - 1] + upsampled
 
-            if mode == 'afe':
-                # 计算角度图
-                angle_map = compute_angle_map(laterals[i-1])
-                enhanced_low = self.dynamic_convs[fusion_idx](laterals[i-1], angle_map)
-                up_high = F.interpolate(laterals[i], size=enhanced_low.shape[-2:], **self.upsample_cfg)
-                laterals[i-1] = enhanced_low + up_high
-            else:  # 'add'
-                up_high = F.interpolate(laterals[i], size=laterals[i-1].shape[-2:], **self.upsample_cfg)
-                laterals[i-1] = laterals[i-1] + up_high
-
+        # 构建输出层
         outs = [self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)]
 
-        # 额外层生成
+        # 额外层（P6, P7 ...）
         if self.num_outs > len(outs):
             if not self.add_extra_convs:
                 for i in range(self.num_outs - used_backbone_levels):
@@ -184,4 +225,8 @@ class AngleFreqEnhanceFPN(FPN):
                     else:
                         outs.append(self.fpn_convs[i](outs[-1]))
 
+        # 确保输出层数与 num_outs 严格一致（防御性代码）
+        assert len(outs) == self.num_outs, \
+            f"FPN outputs {len(outs)} levels but num_outs={self.num_outs}. " \
+            f"Check add_extra_convs, num_outs and backbone levels."
         return tuple(outs)
