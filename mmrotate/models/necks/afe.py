@@ -130,6 +130,7 @@ class AngleFreqEnhance(nn.Module):
             self._hann_window = hann_2d.unsqueeze(0).unsqueeze(0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
         B, C, H, W = x.shape
         device = x.device
 
