@@ -1,4 +1,3 @@
-# afe_angle_minimal.py
 import math
 import torch
 import torch.nn as nn
@@ -11,10 +10,7 @@ from typing import List, Optional
 
 class AngleFreqEnhance(nn.Module):
     """
-    基于原版 afe7595 的修改：将半径分组改为角度分组。
-    - 权重形状 (n_angles,)
-    - 高频掩码保留
-    - 其他逻辑（投影、残差等）与原版一致
+    频域角度增强模块：将特征图投影到中继通道，进行频域角度权重增强，再还原。
     """
 
     def __init__(self,
@@ -33,6 +29,7 @@ class AngleFreqEnhance(nn.Module):
         self.c_mid = c_mid
         self.eps = eps
 
+        # 动态投影层，适应输入通道
         self.proj_in = nn.Conv2d(in_channels, c_mid, kernel_size=1, bias=False)
         self.proj_out = nn.Conv2d(c_mid, in_channels, kernel_size=1, bias=False)
 
@@ -52,32 +49,28 @@ class AngleFreqEnhance(nn.Module):
             r = torch.sqrt((y - cy) ** 2 + (x - cx) ** 2)
             theta = torch.atan2(y - cy, x - cx) + math.pi
 
-            # 角度分组索引（均匀划分）
             angle_step = 2 * math.pi / self.n_angles
             angle_idx = (theta / angle_step).floor().long() % self.n_angles
-
-            # 高频掩码（与原版相同）
             r_max = max(cy, cx) if max(cy, cx) > 0 else 1
             high_freq_mask = (r > self.high_freq_ratio * r_max)
 
-            self.angle_idx = angle_idx.unsqueeze(0).unsqueeze(0)   # [1,1,H,W]
-            self.high_freq_mask = high_freq_mask.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+            self.angle_idx = angle_idx.unsqueeze(0).unsqueeze(0)
+            self.high_freq_mask = high_freq_mask.unsqueeze(0).unsqueeze(0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         x_proj = self.proj_in(x)
 
         self._set_masks(H, W, x.device)
-
-        # 扩展掩码到 batch 和 c_mid 通道
-        a_idx = self.angle_idx.expand(B, self.c_mid, -1, -1)   # [B, c_mid, H, W]
+        # 扩展掩码以匹配投影后的通道数 c_mid
+        a_idx = self.angle_idx.expand(B, self.c_mid, -1, -1)
         hf_mask = self.high_freq_mask.expand(B, self.c_mid, -1, -1)
 
         x_fft = torch.fft.fft2(x_proj, norm='ortho')
         x_fft_shift = torch.fft.fftshift(x_fft, dim=(-2, -1))
 
-        # 应用角度权重（与原版相同的 torch.where 逻辑）
-        weights = self.angle_weights[a_idx]   # [B, c_mid, H, W]
+        # 应用角度权重
+        weights = self.angle_weights[a_idx]
         gain = torch.where(hf_mask, weights, torch.ones_like(weights))
 
         x_fft_shift = x_fft_shift * gain
@@ -91,12 +84,17 @@ class AngleFreqEnhance(nn.Module):
 
 @ROTATED_NECKS.register_module()
 class AngleFreqEnhanceFPN(FPN):
+    """
+    创新点：在 FPN 的侧向连接处对 P2-P5 分别进行频域角度增强，随后进行 Top-down 融合。
+    """
+
     def __init__(self,
                  in_channels,
                  out_channels,
                  num_outs,
+                 # 控制哪些层需要 AFE，默认 [0,1,2,3] 对应 P2, P3, P4, P5
                  enhance_levels: List[int] = [0, 1, 2, 3],
-                 afe_cfg: dict = dict(n_angles=8, c_mid=16, high_freq_ratio=0.3),
+                 afe_cfg: dict = dict(n_angles=32, c_mid=16),
                  **kwargs):
         super(AngleFreqEnhanceFPN, self).__init__(
             in_channels=in_channels,
@@ -105,29 +103,41 @@ class AngleFreqEnhanceFPN(FPN):
             **kwargs)
 
         self.enhance_levels = enhance_levels
+
+        # 为每个 backbone 级别构建独立的 AFE 模块
         self.afe_modules = nn.ModuleList()
         for i in range(len(in_channels)):
             if i in enhance_levels:
+                # 传入 out_channels，因为 AFE 作用在侧向连接（256通道）之后
                 self.afe_modules.append(AngleFreqEnhance(in_channels=out_channels, **afe_cfg))
             else:
                 self.afe_modules.append(nn.Identity())
 
     @auto_fp16()
     def forward(self, inputs):
+        # 1. 构建侧向连接并立即应用 AFE 增强
+        # laterals[0]->P2, laterals[1]->P3, laterals[2]->P4, laterals[3]->P5
         laterals = []
         for i, lateral_conv in enumerate(self.lateral_convs):
             feat = lateral_conv(inputs[i + self.start_level])
+            # 对当前层进行 AFE 增强（P2-P5 独立处理）
             feat = self.afe_modules[i](feat)
             laterals.append(feat)
 
+        # 2. Top-down 融合
         used_backbone_levels = len(laterals)
         for i in range(used_backbone_levels - 1, 0, -1):
+            # 这里的融合逻辑：上一层上采样 + 当前层(已增强)
             prev_shape = laterals[i - 1].shape[2:]
             upsampled = F.interpolate(laterals[i], size=prev_shape, **self.upsample_cfg)
             laterals[i - 1] = laterals[i - 1] + upsampled
 
-        outs = [self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)]
+        # 3. 构建输出层 (P2-P5 的 3x3 卷积)
+        outs = [
+            self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)
+        ]
 
+        # 4. 额外的层 (如 P6, P7)
         if self.num_outs > len(outs):
             if not self.add_extra_convs:
                 for i in range(self.num_outs - used_backbone_levels):
@@ -141,6 +151,7 @@ class AngleFreqEnhanceFPN(FPN):
                     extra_source = outs[-1]
                 else:
                     raise NotImplementedError
+
                 outs.append(self.fpn_convs[used_backbone_levels](extra_source))
                 for i in range(used_backbone_levels + 1, self.num_outs):
                     if self.relu_before_extra_convs:
