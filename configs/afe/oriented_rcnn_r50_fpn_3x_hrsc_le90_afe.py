@@ -23,10 +23,11 @@ model = dict(
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
         num_outs=5,
-        enhance_levels=[0, 1, 2, 3],  # 对 P2,P3,P4,P5 都增强
+        enhance_levels=[1, 2],  # 先只增强 P3,P4
         afe_cfg=dict(
-            c_mid=16,  # 关键：保持小通道
-            n_angles=8,  # 8 个角度扇区
+            c_mid=16,
+            n_angles=8,
+            high_freq_ratio=0.3,
             learnable_weights=True,
             residual=True,
         ),
