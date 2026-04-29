@@ -179,5 +179,5 @@ data = dict(
 #     betas=(0.9, 0.999),
 #     weight_decay=0.05)
 
-evaluation = dict(interval=1, metric='mAP', start=2)
+evaluation = dict(interval=1, metric='mAP', start=1)
 optimizer = dict(lr=0.005)
