@@ -20,10 +20,10 @@ model = dict(
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
         type='AngleFreqEnhanceFPN',
-        in_channels=[256, 512, 1024, 2048],  # 根据 backbone 调整
+        in_channels=[256, 512, 1024, 2048],
         out_channels=256,
-        num_outs=5,
-        enhance_levels=[0, 1, 2, 3],  # P2~P5 都增强
+        num_outs=5,  # 重要：必须与 anchor_generator.strides 长度一致
+        enhance_levels=None,  # 可选，不提供则对所有侧向层增强
         afe_cfg=dict(
             c_mid=16,
             n_angles=12,  # 12个扇区，每15°
@@ -33,8 +33,8 @@ model = dict(
             residual=True,
             use_hann_window=False,
         ),
-        start_level=1,  # 从 backbone 的 stride=4 开始
-        add_extra_convs='on_output',  # 生成 P6
+        start_level=1,
+        add_extra_convs='on_output',
         relu_before_extra_convs=True,
         norm_cfg=dict(type='BN', requires_grad=True)
     ),
