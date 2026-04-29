@@ -10,169 +10,199 @@ from typing import List, Optional
 
 class AngleFreqEnhance(nn.Module):
     """
-    基于 afe7595 添加半径分组功能。
-    - 保留原有角度权重和高频掩码。
-    - 新增：在半径方向划分圆环，每个圆环一个可学习权重（仅在有效高频区域应用）。
-    - 开关 use_radius_groups 控制是否启用半径分组；关闭时行为与原版一致。
+    频域角度增强模块（支持恒等模式调试）
+    若 identity=True，模块不修改特征，直接返回输入。
     """
 
     def __init__(self,
                  in_channels: int = 256,
+                 c_mid: int = 16,
                  n_angles: int = 8,
+                 radius_width: int = 8,
+                 overlap_ratio: float = 1.5,
                  high_freq_ratio: float = 0.3,
                  learnable_weights: bool = True,
-                 enhance_init: float = 1.0,
                  residual: bool = True,
-                 c_mid: int = 16,
-                 eps: float = 1e-8,
-                 use_radius_groups: bool = False,      # 新增：半径分组开关
-                 radius_width: int = 8,                # 半径分组宽度（像素）
-                 n_radii: int = 8,                     # 半径分组数量（若指定则覆盖 radius_width）
-                 ):
+                 use_hann_window: bool = False,
+                 out_clip: float = 10.0,
+                 identity: bool = False,          # 新增恒等模式开关
+                 eps: float = 1e-8):
         super().__init__()
+        if identity:
+            # 恒等模式：不创建任何参数，forward 直接返回 x
+            self.identity = True
+            return
+
+        self.identity = False
+        self.in_channels = in_channels
+        self.c_mid = c_mid
         self.n_angles = n_angles
+        self.radius_width = radius_width
+        self.overlap_ratio = overlap_ratio
         self.high_freq_ratio = high_freq_ratio
         self.residual = residual
-        self.c_mid = c_mid
+        self.use_hann_window = use_hann_window
+        self.out_clip = out_clip
         self.eps = eps
-        self.use_radius_groups = use_radius_groups
 
-        # 动态投影层
+        # 投影层
         self.proj_in = nn.Conv2d(in_channels, c_mid, kernel_size=1, bias=False)
         self.proj_out = nn.Conv2d(c_mid, in_channels, kernel_size=1, bias=False)
+        nn.init.kaiming_normal_(self.proj_in.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.kaiming_normal_(self.proj_out.weight, mode='fan_out', nonlinearity='relu')
 
-        # 角度权重（与原版一致）
+        # 可学习权重：形状 (c_mid, n_angles, n_radii)，n_radii 动态调整
         if learnable_weights:
-            self.angle_weights = nn.Parameter(torch.full((n_angles,), enhance_init))
+            self.weights_raw = nn.Parameter(torch.ones(c_mid, n_angles, 1))
         else:
-            self.register_buffer('angle_weights', torch.full((n_angles,), enhance_init))
+            self.register_buffer('weights_raw', torch.ones(c_mid, n_angles, 1))
 
-        # 半径分组权重（仅当 use_radius_groups=True 时使用）
-        if use_radius_groups:
-            # 半径分组数量（如果指定 n_radii 则用它，否则根据 radius_width 和最大半径计算）
-            self.register_buffer('_radius_width', torch.tensor(radius_width))
-            # 半径权重：形状 (n_radii, )，初始为1
-            if learnable_weights:
-                self.radius_weights = nn.Parameter(torch.ones(n_radii))
-            else:
-                self.register_buffer('radius_weights', torch.ones(n_radii))
-        else:
-            self.radius_weights = None
-
-        # 缓冲区
-        self.register_buffer('angle_idx', None)
+        # 缓存
+        self.register_buffer('radius_idx', None)
+        self.register_buffer('angle_weights', None)
         self.register_buffer('high_freq_mask', None)
-        self.register_buffer('radius_idx', None)   # 半径索引（仅当 use_radius_groups=True）
+        self.register_buffer('_hann_window', None)
+        self._cached_HW = None
+        self._cached_n_radii = None
 
-    def _set_masks(self, H: int, W: int, device: torch.device):
-        """生成角度索引、高频掩码，以及可选的半径索引"""
-        if self.angle_idx is None or self.angle_idx.shape[-2:] != (H, W):
-            cy, cx = H // 2, W // 2
-            y, x = torch.meshgrid(torch.arange(H, device=device),
-                                  torch.arange(W, device=device), indexing='ij')
-            r = torch.sqrt((y - cy) ** 2 + (x - cx) ** 2)
-            theta = torch.atan2(y - cy, x - cx) + math.pi
+    def _build_masks(self, H: int, W: int, device: torch.device):
+        """生成半径索引、角度软分配权重、高频掩码（可选）"""
+        cy, cx = H // 2, W // 2
+        y, x = torch.meshgrid(torch.arange(H, device=device),
+                              torch.arange(W, device=device), indexing='ij')
+        r = torch.sqrt((y - cy) ** 2 + (x - cx) ** 2).float()
+        theta = torch.atan2(y - cy, x - cx) + math.pi
 
-            # 角度索引（与原版一致）
-            angle_step = 2 * math.pi / self.n_angles
-            angle_idx = (theta / angle_step).floor().long() % self.n_angles
+        max_r = max(cy, cx)
+        n_radii = int(max_r // self.radius_width) + 1
+        radius_idx = torch.floor(r / self.radius_width).long().clamp(0, n_radii - 1)
 
-            # 高频掩码
-            r_max = max(cy, cx) if max(cy, cx) > 0 else 1
-            high_freq_mask = (r > self.high_freq_ratio * r_max)
+        theta = theta % math.pi
+        delta = math.pi / self.n_angles
+        half_width = self.overlap_ratio * delta / 2.0
+        angle_weights = torch.zeros(self.n_angles, H, W, device=device)
+        for a in range(self.n_angles):
+            center = a * delta + delta / 2.0
+            dist = (theta - center).abs()
+            mask = dist < half_width
+            w = (1 - dist / half_width).clamp(min=0)
+            angle_weights[a] = w * mask.float()
+        sum_w = angle_weights.sum(dim=0, keepdim=True) + self.eps
+        angle_weights = angle_weights / sum_w
 
-            self.angle_idx = angle_idx.unsqueeze(0).unsqueeze(0)
-            self.high_freq_mask = high_freq_mask.unsqueeze(0).unsqueeze(0)
+        # 高频掩码（可选）
+        if self.high_freq_ratio > 0:
+            high_freq_mask = (r > self.high_freq_ratio * max_r)
+        else:
+            high_freq_mask = torch.ones_like(r, dtype=torch.bool)
 
-            # 半径索引（如果需要）
-            if self.use_radius_groups:
-                # 计算半径分组数
-                if hasattr(self, '_n_radii'):
-                    n_radii = self._n_radii
+        # 排除直流分量（半径 < 0.5）
+        dc_mask = (r < 0.5)
+        valid_mask = ~dc_mask & high_freq_mask
+
+        self.radius_idx = radius_idx.unsqueeze(0).unsqueeze(0)
+        self.angle_weights = angle_weights.unsqueeze(0)
+        self.valid_mask = valid_mask.unsqueeze(0).unsqueeze(0)
+        self._cached_HW = (H, W)
+        self._cached_n_radii = n_radii
+
+        # 调整权重尺寸
+        if hasattr(self, 'weights_raw') and self.weights_raw is not None:
+            if self.weights_raw.size(-1) != n_radii:
+                new_weights = torch.ones(self.c_mid, self.n_angles, n_radii, device=device)
+                if isinstance(self.weights_raw, nn.Parameter):
+                    self.weights_raw = nn.Parameter(new_weights)
                 else:
-                    # 根据 radius_width 计算
-                    max_r = r_max
-                    n_radii = int(max_r // self._radius_width.item()) + 1
-                    self._n_radii = n_radii
-                radius_idx = torch.floor(r / self._radius_width.item()).long().clamp(0, n_radii - 1)
-                self.radius_idx = radius_idx.unsqueeze(0).unsqueeze(0)
+                    self.weights_raw = new_weights
 
-                # 调整 radius_weights 的维度
-                if self.radius_weights is not None and self.radius_weights.size(0) != n_radii:
-                    new_weights = torch.ones(n_radii, device=device)
-                    if isinstance(self.radius_weights, nn.Parameter):
-                        self.radius_weights = nn.Parameter(new_weights)
-                    else:
-                        self.radius_weights = new_weights
+        if self.use_hann_window and self._hann_window is None:
+            hann_h = torch.hann_window(H, device=device)
+            hann_w = torch.hann_window(W, device=device)
+            self._hann_window = (hann_h.unsqueeze(1) * hann_w.unsqueeze(0)).unsqueeze(0).unsqueeze(0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.identity:
+            return x
+
         B, C, H, W = x.shape
-        x_proj = self.proj_in(x)   # [B, c_mid, H, W]
+        device = x.device
 
-        self._set_masks(H, W, x.device)
+        x_proj = self.proj_in(x)
 
-        # 扩展掩码到 batch 和 c_mid 通道
-        a_idx = self.angle_idx.expand(B, self.c_mid, -1, -1)
-        hf_mask = self.high_freq_mask.expand(B, self.c_mid, -1, -1)
+        if self.use_hann_window:
+            if self._hann_window is None or self._hann_window.shape[-2:] != (H, W):
+                self._build_masks(H, W, device)
+            x_proj = x_proj * self._hann_window
 
+        # FFT
         x_fft = torch.fft.fft2(x_proj, norm='ortho')
         x_fft_shift = torch.fft.fftshift(x_fft, dim=(-2, -1))
         mag = x_fft_shift.abs() + self.eps
 
-        # 基础角度权重
-        weights_angle = self.angle_weights[a_idx]   # [B, c_mid, H, W]
+        if self._cached_HW != (H, W):
+            self._build_masks(H, W, device)
 
-        # 半径分组权重（如果启用）
-        if self.use_radius_groups and self.radius_idx is not None:
-            r_idx = self.radius_idx.expand(B, self.c_mid, -1, -1)   # [B, c_mid, H, W]
-            # 为每个空间位置分配半径权重
-            # radius_weights 是一维 [n_radii]
-            if self.radius_weights is not None:
-                radius_gain = self.radius_weights[r_idx]            # [B, c_mid, H, W]
-                # 最终增益 = 角度权重 * 半径权重
-                gain = weights_angle * radius_gain
-            else:
-                gain = weights_angle
-        else:
-            gain = weights_angle
+        r_idx = self.radius_idx.expand(B, -1, H, W)
+        aw = self.angle_weights.expand(B, -1, H, W)
+        valid_mask = self.valid_mask.expand(B, -1, H, W)
+        n_radii = self._cached_n_radii
 
-        # 只在高频区域应用增益，低频区域增益为1
-        gain = torch.where(hf_mask, gain, torch.ones_like(gain))
+        # 增益计算，范围限制 (0,2)
+        gain = torch.ones(B, self.c_mid, H, W, device=device)
+        for c in range(self.c_mid):
+            w_c_raw = self.weights_raw[c]                     # [n_angles, n_radii]
+            w_c = 1 + torch.tanh(w_c_raw)                     # (0,2)
+            gain_c = torch.zeros(B, H, W, device=device)
+            for r in range(n_radii):
+                mask_r = (r_idx == r).float().squeeze(1)
+                w_r = w_c[:, r]                               # [n_angles]
+                weighted_angles = (aw * w_r.view(1, -1, 1, 1)).sum(dim=1)
+                gain_c += weighted_angles * mask_r
+            gain[:, c, :, :] = torch.where(valid_mask.squeeze(1), gain_c, torch.ones_like(gain_c))
 
-        x_fft_shift = x_fft_shift * gain
+        mag_enhanced = mag * gain
+        x_fft_shift_enhanced = mag_enhanced * torch.exp(1j * torch.angle(x_fft_shift))
 
-        x_fft_ishift = torch.fft.ifftshift(x_fft_shift, dim=(-2, -1))
+        x_fft_ishift = torch.fft.ifftshift(x_fft_shift_enhanced, dim=(-2, -1))
         x_enh = torch.fft.ifft2(x_fft_ishift, norm='ortho').real
         x_enh = self.proj_out(x_enh)
 
-        return x + x_enh if self.residual else x_enh
+        if self.out_clip is not None:
+            x_enh = torch.clamp(x_enh, -self.out_clip, self.out_clip)
+
+        if self.residual:
+            return x + x_enh
+        else:
+            return x_enh
 
 
 @ROTATED_NECKS.register_module()
 class AngleFreqEnhanceFPN(FPN):
-    """与 afe7595 中相同的 FPN 封装（仅添加半径分组参数）"""
+    """在 FPN 的侧向连接处添加频域角度增强模块（支持恒等模式）"""
 
     def __init__(self,
                  in_channels,
                  out_channels,
                  num_outs,
-                 enhance_levels: List[int] = [0, 1, 2, 3],
-                 afe_cfg: dict = dict(n_angles=8, c_mid=16),
+                 enhance_levels: Optional[List[int]] = None,
+                 afe_cfg: dict = dict(
+                     c_mid=16, n_angles=8, radius_width=8, overlap_ratio=1.5,
+                     high_freq_ratio=0.3, learnable_weights=True, residual=True,
+                     use_hann_window=False, out_clip=10.0, identity=False),
                  **kwargs):
-        super(AngleFreqEnhanceFPN, self).__init__(
+        super().__init__(
             in_channels=in_channels,
             out_channels=out_channels,
             num_outs=num_outs,
             **kwargs)
 
-        self.enhance_levels = enhance_levels
-
+        num_lateral = len(self.lateral_convs)
         self.afe_modules = nn.ModuleList()
-        for i in range(len(in_channels)):
-            if i in enhance_levels:
-                self.afe_modules.append(AngleFreqEnhance(in_channels=out_channels, **afe_cfg))
-            else:
+        for i in range(num_lateral):
+            if enhance_levels is not None and i not in enhance_levels:
                 self.afe_modules.append(nn.Identity())
+            else:
+                self.afe_modules.append(AngleFreqEnhance(in_channels=out_channels, **afe_cfg))
 
     @auto_fp16()
     def forward(self, inputs):
@@ -191,7 +221,6 @@ class AngleFreqEnhanceFPN(FPN):
         outs = [self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)]
 
         if self.num_outs > len(outs):
-            # 处理额外层（与原始 FPN 一致）
             if not self.add_extra_convs:
                 for i in range(self.num_outs - used_backbone_levels):
                     outs.append(F.max_pool2d(outs[-1], 1, stride=2))
