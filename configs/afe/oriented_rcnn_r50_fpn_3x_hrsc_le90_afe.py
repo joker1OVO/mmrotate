@@ -20,21 +20,21 @@ model = dict(
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
         type='AngleFreqEnhanceFPN',
-        in_channels=[256, 512, 1024, 2048],  # 对应 ResNet 的 C2~C5 输出通道
-        out_channels=256,  # FPN 所有输出层的统一通道数
-        num_outs=5,  # 输出特征金字塔层数（P2~P6）
-        enhance_levels=[0, 1, 2, 3],  # 0->P2, 1->P3, 2->P4, 3->P5，全部增强
+        in_channels=[256, 512, 1024, 2048],  # 根据 backbone 调整
+        out_channels=256,
+        num_outs=5,
+        enhance_levels=[0, 1, 2, 3],  # P2~P5 都增强
         afe_cfg=dict(
-            c_mid=16,  # 投影后的中间通道数（控制计算量）
-            n_angles=8,  # 角度扇区数量
-            radius_width=8,  # 半径环的宽度（像素）
-            overlap_ratio=1.5,  # 角度软重叠系数
-            learnable_weights=True,  # 是否学习权重（每个 (channel, angle, radius) 独立）
-            residual=True,  # 是否使用残差连接（推荐保留）
-            use_hann_window=False,  # 是否在 FFT 前加汉宁窗（减少频谱泄露，可选）
+            c_mid=16,
+            n_angles=12,  # 12个扇区，每15°
+            radius_width=8,
+            overlap_ratio=1.5,  # 轻度重叠
+            learnable_weights=True,
+            residual=True,
+            use_hann_window=False,
         ),
-        start_level=0,  # 从输入特征的第几个开始（ResNet 通常为 0 对应 C2）
-        add_extra_convs='on_output',  # 生成额外层（如 P6）的方式
+        start_level=1,  # 从 backbone 的 stride=4 开始
+        add_extra_convs='on_output',  # 生成 P6
         relu_before_extra_convs=True,
         norm_cfg=dict(type='BN', requires_grad=True)
     ),
