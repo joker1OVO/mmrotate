@@ -20,17 +20,10 @@ model = dict(
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
         type='AngleFreqEnhanceFPN',
+        skip_afe=True,  # 彻底跳过所有 AFE 模块
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
         num_outs=5,
-        enhance_levels=None,
-        afe_cfg=dict(
-            mode='identity',  # 直接返回输入
-            c_mid=16,  # 其他参数任意，不会用到
-            n_angles=12,
-            radius_width=8,
-            overlap_ratio=1.5,
-        ),
         start_level=1,
         add_extra_convs='on_output',
         relu_before_extra_convs=True,

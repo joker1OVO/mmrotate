@@ -10,19 +10,12 @@ from typing import List, Optional
 
 class AngleFreqEnhance(nn.Module):
     """
-    频域角度增强模块，支持多种模式用于逐步调试。
-
-    mode:
-        'identity' : 直接返回 x，不进行任何操作
-        'proj'     : 仅进行 proj_in + proj_out + 残差，无 FFT
-        'fft'      : proj_in -> FFT -> IFFT -> proj_out -> 残差，不加权
-        'fixed'    : 对幅度谱乘以固定标量（默认 1.0，可调），无分组加权
-        'full'     : 完整的分组加权（半径+角度）
+    频域角度增强模块。
+    支持多种模式用于逐步调试。
     """
-
     def __init__(self,
                  in_channels: int = 256,
-                 mode: str = 'identity',          # 调试模式
+                 mode: str = 'identity',
                  c_mid: int = 16,
                  n_angles: int = 8,
                  radius_width: int = 8,
@@ -32,7 +25,7 @@ class AngleFreqEnhance(nn.Module):
                  residual: bool = True,
                  use_hann_window: bool = False,
                  out_clip: float = 10.0,
-                 fixed_gain: float = 1.0,         # 固定增益值（mode='fixed'时使用）
+                 fixed_gain: float = 1.0,
                  eps: float = 1e-8):
         super().__init__()
         self.mode = mode
@@ -123,44 +116,41 @@ class AngleFreqEnhance(nn.Module):
             self._hann_window = (hann_h.unsqueeze(1) * hann_w.unsqueeze(0)).unsqueeze(0).unsqueeze(0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 模式1：恒等
         if self.mode == 'identity':
             return x
 
         B, C, H, W = x.shape
         device = x.device
 
-        # 投影
         x_proj = self.proj_in(x)
 
         # 加窗（可选）
         if self.use_hann_window and self.mode != 'proj':
-            # 仅非 proj 模式需要 FFT，才可能加窗
             if not hasattr(self, '_hann_window') or self._hann_window is None:
                 self._build_masks(H, W, device)
             x_proj = x_proj * self._hann_window
 
-        # 模式2：仅投影（无 FFT）
+        # 模式：仅投影
         if self.mode == 'proj':
             x_enh = self.proj_out(x_proj)
             if self.out_clip is not None:
                 x_enh = torch.clamp(x_enh, -self.out_clip, self.out_clip)
             return x + x_enh if self.residual else x_enh
 
-        # 以下模式均需要 FFT
+        # FFT
         x_fft = torch.fft.fft2(x_proj, norm='ortho')
         x_fft_shift = torch.fft.fftshift(x_fft, dim=(-2, -1))
         mag = x_fft_shift.abs() + self.eps
 
-        # 模式3：纯 FFT/IFFT，不加权
+        # 模式：纯 FFT/IFFT
         if self.mode == 'fft':
-            mag_enhanced = mag   # 保持不变
+            mag_enhanced = mag
             x_fft_shift_enhanced = mag_enhanced * torch.exp(1j * torch.angle(x_fft_shift))
-        # 模式4：固定增益（乘以标量）
+        # 模式：固定增益
         elif self.mode == 'fixed':
             mag_enhanced = mag * self.fixed_gain
             x_fft_shift_enhanced = mag_enhanced * torch.exp(1j * torch.angle(x_fft_shift))
-        # 模式5：完整分组加权
+        # 模式：全分组
         elif self.mode == 'full':
             if self._cached_HW != (H, W):
                 self._build_masks(H, W, device)
@@ -202,11 +192,15 @@ class AngleFreqEnhance(nn.Module):
 
 @ROTATED_NECKS.register_module()
 class AngleFreqEnhanceFPN(FPN):
+    """
+    FPN + 频域角度增强。支持 skip_afe 模式，完全跳过所有 AFE 模块（原始 FPN）。
+    """
     def __init__(self,
                  in_channels,
                  out_channels,
                  num_outs,
                  enhance_levels: Optional[List[int]] = None,
+                 skip_afe: bool = False,      # 完全跳过 AFE，相当于原始 FPN
                  afe_cfg: dict = None,
                  **kwargs):
         super().__init__(
@@ -215,28 +209,31 @@ class AngleFreqEnhanceFPN(FPN):
             num_outs=num_outs,
             **kwargs)
 
-        if afe_cfg is None:
-            afe_cfg = {}
+        self.skip_afe = skip_afe
+        if skip_afe:
+            # 完全不创建任何 AFE 模块，直接使用 Identity（实际上也不会被调用）
+            self.afe_modules = nn.ModuleList([nn.Identity() for _ in range(len(self.lateral_convs))])
+        else:
+            if afe_cfg is None:
+                afe_cfg = {}
+            afe_cfg.setdefault('mode', 'identity')
+            afe_cfg['in_channels'] = out_channels
 
-        # 默认模式为 identity（方便调试）
-        afe_cfg.setdefault('mode', 'identity')
-        # 确保 in_channels 传递正确
-        afe_cfg['in_channels'] = out_channels
-
-        num_lateral = len(self.lateral_convs)
-        self.afe_modules = nn.ModuleList()
-        for i in range(num_lateral):
-            if enhance_levels is not None and i not in enhance_levels:
-                self.afe_modules.append(nn.Identity())
-            else:
-                self.afe_modules.append(AngleFreqEnhance(**afe_cfg))
+            num_lateral = len(self.lateral_convs)
+            self.afe_modules = nn.ModuleList()
+            for i in range(num_lateral):
+                if enhance_levels is not None and i not in enhance_levels:
+                    self.afe_modules.append(nn.Identity())
+                else:
+                    self.afe_modules.append(AngleFreqEnhance(**afe_cfg))
 
     @auto_fp16()
     def forward(self, inputs):
         laterals = []
         for i, lateral_conv in enumerate(self.lateral_convs):
             feat = lateral_conv(inputs[i + self.start_level])
-            feat = self.afe_modules[i](feat)
+            if not self.skip_afe:
+                feat = self.afe_modules[i](feat)
             laterals.append(feat)
 
         used_backbone_levels = len(laterals)
