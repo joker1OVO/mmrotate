@@ -19,10 +19,27 @@ model = dict(
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
-        type='FPN',
+        type='AngleFreqEnhanceFPN',
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
-        num_outs=5),
+        num_outs=5,
+        enhance_levels=[0, 1, 2, 3],  # 对 P2~P5 都增强
+        afe_cfg=dict(
+            n_angles=8,  # 角度扇区数（与原版一致）
+            high_freq_ratio=0.3,  # 高频比例
+            learnable_weights=True,
+            enhance_init=1.0,
+            residual=True,
+            c_mid=16,
+            use_radius_groups=True,  # 开启半径分组
+            radius_width=8,  # 半径组宽度（像素），用于计算组数
+            n_radii=16,  # 也可直接指定半径组数（优先于 radius_width）
+        ),
+        start_level=1,
+        add_extra_convs='on_output',
+        relu_before_extra_convs=True,
+        norm_cfg=dict(type='BN', requires_grad=True)
+    ),
     rpn_head=dict(
         type='OrientedRPNHead',
         in_channels=256,

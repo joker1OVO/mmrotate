@@ -17,25 +17,10 @@ model = dict(
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
-        type='AngleFreqEnhanceFPN',
+        type='FPN',
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
-        num_outs=5,  # 重要：必须与 anchor_generator.strides 长度一致
-        enhance_levels=None,  # 可选，不提供则对所有侧向层增强
-        afe_cfg=dict(
-            c_mid=64,
-            n_angles=12,  # 12个扇区，每15°
-            radius_width=8,
-            overlap_ratio=1.5,  # 轻度重叠
-            learnable_weights=True,
-            residual=True,
-            use_hann_window=False,
-        ),
-        start_level=1,
-        add_extra_convs='on_output',
-        relu_before_extra_convs=True,
-        norm_cfg=dict(type='BN', requires_grad=True)
-    ),
+        num_outs=5),
     rpn_head=dict(
         type='OrientedRPNHead',
         in_channels=256,
