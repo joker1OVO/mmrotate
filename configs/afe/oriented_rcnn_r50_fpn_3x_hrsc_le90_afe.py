@@ -20,10 +20,16 @@ model = dict(
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
         type='AngleFreqEnhanceFPN',
-        skip_afe=True,  # 彻底跳过所有 AFE 模块
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
         num_outs=5,
+        enhance_levels=[0, 1, 2, 3],  # 对 P2,P3,P4,P5 都增强（可根据需要减少）
+        afe_cfg=dict(
+            c_mid=16,  # 关键：保持小通道
+            n_angles=8,  # 8 个角度扇区
+            learnable_weights=True,
+            residual=True,
+        ),
         start_level=1,
         add_extra_convs='on_output',
         relu_before_extra_convs=True,
@@ -161,12 +167,12 @@ data = dict(
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 
-optimizer = dict(
-    _delete_=True,
-    type='AdamW',
-    lr=0.0004,
-    betas=(0.9, 0.999),
-    weight_decay=0.05)
+# optimizer = dict(
+#     _delete_=True,
+#     type='AdamW',
+#     lr=0.0004,
+#     betas=(0.9, 0.999),
+#     weight_decay=0.05)
 
 evaluation = dict(interval=1, metric='mAP', start=1)
 # optimizer = dict(lr=0.005)
