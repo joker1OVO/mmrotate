@@ -28,7 +28,7 @@ model = dict(
             n_angles=8,  # 8个角度扇区
             high_freq_ratio=0.3,  # 高频比例，直流/低频被排除
             learnable_weights=True,
-            gain_range=0.5,  # 增益范围 [0.5, 1.5]
+            gain_range=0.2,  # 增益范围 [0.5, 1.5]
             residual=True,
             c_mid=16,
         ),
