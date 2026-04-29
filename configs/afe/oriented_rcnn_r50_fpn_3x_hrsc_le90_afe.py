@@ -19,10 +19,27 @@ model = dict(
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
-        type='FPN',
+        type='AngleFreqEnhanceFPN',
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
-        num_outs=5),
+        num_outs=5,
+        enhance_levels=None,  # 所有侧向层都进行处理（但 identity=True 时实际无处理）
+        afe_cfg=dict(
+            identity=True,  # 关键：恒等模式，不使用真正的 AFE
+            # 其他参数任意，因为不会用到
+            c_mid=16,
+            n_angles=12,
+            radius_width=8,
+            overlap_ratio=1.5,
+            learnable_weights=True,
+            residual=True,
+            use_hann_window=False,
+        ),
+        start_level=1,
+        add_extra_convs='on_output',
+        relu_before_extra_convs=True,
+        norm_cfg=dict(type='BN', requires_grad=True)
+    ),
     rpn_head=dict(
         type='OrientedRPNHead',
         in_channels=256,
