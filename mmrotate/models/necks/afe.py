@@ -195,7 +195,7 @@ class AngleFreqEnhanceFPN(FPN):
             out_channels=out_channels,
             num_outs=num_outs,
             **kwargs)
-
+        self.afe_modules = nn.ModuleList([nn.Identity() for _ in range(len(self.lateral_convs))])
         num_lateral = len(self.lateral_convs)
         self.afe_modules = nn.ModuleList()
         for i in range(num_lateral):
