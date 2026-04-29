@@ -10,7 +10,8 @@ from typing import List, Optional
 
 class AngleFreqEnhance(nn.Module):
     """
-    频域角度增强模块（仅在 identity=False 时生效）
+    频域角度增强模块。
+    当 identity=True 时，模块不创建任何参数，forward 直接返回输入（与 nn.Identity 等效）。
     """
     def __init__(self,
                  in_channels: int = 256,
@@ -23,8 +24,15 @@ class AngleFreqEnhance(nn.Module):
                  residual: bool = True,
                  use_hann_window: bool = False,
                  out_clip: float = 10.0,
+                 identity: bool = False,   # 新增：恒等模式开关
                  eps: float = 1e-8):
         super().__init__()
+        if identity:
+            # 恒等模式：不创建任何子模块，forward 直接返回输入
+            self.identity = True
+            return
+
+        self.identity = False
         self.in_channels = in_channels
         self.c_mid = c_mid
         self.n_angles = n_angles
@@ -57,6 +65,7 @@ class AngleFreqEnhance(nn.Module):
         self._cached_n_radii = None
 
     def _build_masks(self, H: int, W: int, device: torch.device):
+        # 与之前相同，省略详细注释
         cy, cx = H // 2, W // 2
         y, x = torch.meshgrid(torch.arange(H, device=device),
                               torch.arange(W, device=device), indexing='ij')
@@ -84,13 +93,12 @@ class AngleFreqEnhance(nn.Module):
             high_freq_mask = (r > self.high_freq_ratio * max_r)
         else:
             high_freq_mask = torch.ones_like(r, dtype=torch.bool)
-
         dc_mask = (r < 0.5)
         valid_mask = ~dc_mask & high_freq_mask
 
-        self.radius_idx = radius_idx.unsqueeze(0).unsqueeze(0)      # [1,1,H,W]
-        self.angle_weights = angle_weights.unsqueeze(0)            # [1, n_angles, H, W]
-        self.valid_mask = valid_mask.unsqueeze(0).unsqueeze(0)     # [1,1,H,W]
+        self.radius_idx = radius_idx.unsqueeze(0).unsqueeze(0)
+        self.angle_weights = angle_weights.unsqueeze(0)
+        self.valid_mask = valid_mask.unsqueeze(0).unsqueeze(0)
         self._cached_HW = (H, W)
         self._cached_n_radii = n_radii
 
@@ -108,6 +116,9 @@ class AngleFreqEnhance(nn.Module):
             self._hann_window = (hann_h.unsqueeze(1) * hann_w.unsqueeze(0)).unsqueeze(0).unsqueeze(0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.identity:
+            return x
+
         B, C, H, W = x.shape
         device = x.device
 
@@ -132,12 +143,12 @@ class AngleFreqEnhance(nn.Module):
 
         gain = torch.ones(B, self.c_mid, H, W, device=device)
         for c in range(self.c_mid):
-            w_c_raw = self.weights_raw[c]                 # [n_angles, n_radii]
-            w_c = 1 + torch.tanh(w_c_raw)                 # (0,2)
+            w_c_raw = self.weights_raw[c]
+            w_c = 1 + torch.tanh(w_c_raw)
             gain_c = torch.zeros(B, H, W, device=device)
             for r in range(n_radii):
                 mask_r = (r_idx == r).float().squeeze(1)
-                w_r = w_c[:, r]                           # [n_angles]
+                w_r = w_c[:, r]
                 weighted_angles = (aw * w_r.view(1, -1, 1, 1)).sum(dim=1)
                 gain_c += weighted_angles * mask_r
             gain[:, c, :, :] = torch.where(valid_mask.squeeze(1), gain_c, torch.ones_like(gain_c))
@@ -161,24 +172,25 @@ class AngleFreqEnhance(nn.Module):
 @ROTATED_NECKS.register_module()
 class AngleFreqEnhanceFPN(FPN):
     """
-    FPN + 频域角度增强（可选恒等模式）
-    当 afe_cfg 中包含 'identity': True 时，使用 nn.Identity 代替真正的 AFE 模块。
+    FPN + 频域角度增强。
+    若 afe_cfg 中包含 'identity': True，则使用 nn.Identity 替代真正的 AFE 模块。
     """
     def __init__(self,
                  in_channels,
                  out_channels,
                  num_outs,
                  enhance_levels: Optional[List[int]] = None,
-                 afe_cfg: dict = dict(
-                     c_mid=16, n_angles=8, radius_width=8, overlap_ratio=1.5,
-                     high_freq_ratio=0.3, learnable_weights=True, residual=True,
-                     use_hann_window=False, out_clip=10.0),
+                 afe_cfg: dict = None,
                  **kwargs):
         super().__init__(
             in_channels=in_channels,
             out_channels=out_channels,
             num_outs=num_outs,
             **kwargs)
+
+        # 默认 afe_cfg
+        if afe_cfg is None:
+            afe_cfg = {}
 
         # 检查是否为恒等模式
         identity_mode = afe_cfg.pop('identity', False)
@@ -190,6 +202,7 @@ class AngleFreqEnhanceFPN(FPN):
                 self.afe_modules.append(nn.Identity())
             else:
                 if identity_mode:
+                    # 直接使用 nn.Identity，不创建 AngleFreqEnhance 实例
                     self.afe_modules.append(nn.Identity())
                 else:
                     self.afe_modules.append(AngleFreqEnhance(in_channels=out_channels, **afe_cfg))

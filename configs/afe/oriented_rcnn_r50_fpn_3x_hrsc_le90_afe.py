@@ -23,11 +23,10 @@ model = dict(
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
         num_outs=5,
-        enhance_levels=None,  # 所有侧向层都进行处理（但 identity=True 时实际无处理）
+        enhance_levels=None,  # 所有侧向层都处理（但恒等模式下实际无操作）
         afe_cfg=dict(
-            identity=True,  # 关键：恒等模式，不使用真正的 AFE
-            # 其他参数任意，因为不会用到
-            c_mid=16,
+            identity=True,  # 关键：恒等模式，不创建任何额外参数
+            c_mid=16,  # 其他参数任意，因为不会用到
             n_angles=12,
             radius_width=8,
             overlap_ratio=1.5,
