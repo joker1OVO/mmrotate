@@ -20,24 +20,30 @@ model = dict(
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
         type='AngleFreqEnhanceFPN',
+        # 输入通道：对应 Backbone 输出的特征图通道数（例如 ResNet 的 C2~C5）
         in_channels=[256, 512, 1024, 2048],
+        # FPN 输出通道数（所有输出层统一通道数）
         out_channels=256,
+        # 输出特征金字塔的层数（例如 P2~P6 共 5 层）
         num_outs=5,
-        enhance_levels=[0, 1, 2, 3],  # 可以对所有层增强，也可只选部分如 [1,2]
-        afe_cfg=dict(
-            n_angles=8,  # 8 个角度扇区
-            n_radii=4,  # 半径分为 4 个环
-            # 或者使用 radius_width=8 来自动计算半径环数（两者选一，代码中优先使用 n_radii 如果 not None）
-            high_freq_ratio=0.3,  # 高频区域比例
-            learnable_weights=True,
-            enhance_init=1.0,
-            residual=True,
-            c_mid=16,
-        ),
-        start_level=0,  # 从 C2 开始
+        # 从 Backbone 的第几层开始提取特征（0 表示从 C2 开始）
+        start_level=0,
+        # 是否额外添加卷积生成 P6/P7 等
         add_extra_convs='on_output',
+        # 在额外卷积前是否使用 ReLU
         relu_before_extra_convs=True,
-        norm_cfg=dict(type='BN', requires_grad=True)
+        # 需要进行频域角度增强的 FPN 侧向连接级别索引（0→P2, 1→P3, 2→P4, 3→P5）
+        enhance_levels=[0, 1, 2, 3],
+        # AngleFreqEnhance 模块的详细配置
+        afe_cfg=dict(
+            n_angles=32,  # 角度划分数量（圆周等分数）
+            high_freq_ratio=0.3,  # 高频区域半径占比
+            learnable_weights=True,  # 角度权重是否可学习
+            enhance_init=1.0,  # 初始增强系数
+            residual=True,  # 是否使用残差连接
+            c_mid=16,  # 投影后的中间通道数
+            eps=1e-8  # 数值稳定性常数
+        )
     ),
     rpn_head=dict(
         type='OrientedRPNHead',
