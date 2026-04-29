@@ -1,3 +1,4 @@
+# afe_fixed.py
 import math
 import torch
 import torch.nn as nn
@@ -10,78 +11,173 @@ from typing import List, Optional
 
 class AngleFreqEnhance(nn.Module):
     """
-    频域角度增强模块（可学习权重，带范围约束，仅高频区域调制）
+    频域极坐标增强模块（修复版）：
+    - 均匀半径分区 + 重叠角度扇区
+    - 通道独立可学习权重
+    - 高频掩码：只调制半径 > high_freq_ratio * max_r 的区域，低频和直流保持 1
+    - 可选权重范围约束（tanh 映射）
     """
 
     def __init__(self,
                  in_channels: int = 256,
-                 n_angles: int = 8,
-                 high_freq_ratio: float = 0.3,
-                 learnable_weights: bool = True,
-                 gain_range: float = 0.5,          # 增益范围 [1-gain_range, 1+gain_range]
-                 residual: bool = True,
                  c_mid: int = 16,
+                 n_angles: int = 8,
+                 radius_width: int = 8,
+                 high_freq_ratio: float = 0.8,      # 新增：高频比例，默认 0.8 只增强最外圈
+                 overlap_ratio: float = 1.5,
+                 learnable_weights: bool = True,
+                 weight_range: float = 0.5,         # 新增：权重范围 [1-weight_range, 1+weight_range]
+                 residual: bool = True,
+                 use_hann_window: bool = False,
                  eps: float = 1e-8):
         super().__init__()
-        self.n_angles = n_angles
-        self.high_freq_ratio = high_freq_ratio
-        self.residual = residual
         self.c_mid = c_mid
+        self.n_angles = n_angles
+        self.radius_width = radius_width
+        self.high_freq_ratio = high_freq_ratio
+        self.overlap_ratio = overlap_ratio
+        self.residual = residual
+        self.use_hann_window = use_hann_window
         self.eps = eps
-        self.gain_range = gain_range
+        self.weight_range = weight_range
 
+        # 投影层
         self.proj_in = nn.Conv2d(in_channels, c_mid, kernel_size=1, bias=False)
         self.proj_out = nn.Conv2d(c_mid, in_channels, kernel_size=1, bias=False)
 
         if learnable_weights:
-            # 初始化为0，映射后增益为1
-            self.angle_weights = nn.Parameter(torch.zeros(n_angles))
+            # 权重形状: (c_mid, n_angles, n_radii)
+            # 初始化为0（映射后为1）或1？为了配合 tanh 限制，初始为0
+            self.weights = nn.Parameter(torch.zeros(c_mid, n_angles, 1))
         else:
-            self.register_buffer('angle_weights', torch.zeros(n_angles))
+            self.register_buffer('weights', torch.zeros(c_mid, n_angles, 1))
 
-        self.register_buffer('angle_idx', None)
-        self.register_buffer('high_freq_mask', None)
+        # 缓存掩码
+        self.register_buffer('radius_idx', None)
+        self.register_buffer('angle_weights', None)
+        self.register_buffer('high_freq_mask', None)   # 新增
+        self.register_buffer('_hann_window', None)
+        self._cached_HW = None
+        self._cached_n_radii = None
 
-    def _set_masks(self, H: int, W: int, device: torch.device):
-        if self.angle_idx is None or self.angle_idx.shape[-2:] != (H, W):
-            cy, cx = H // 2, W // 2
-            y, x = torch.meshgrid(torch.arange(H, device=device),
-                                  torch.arange(W, device=device), indexing='ij')
-            r = torch.sqrt((y - cy) ** 2 + (x - cx) ** 2)
-            theta = torch.atan2(y - cy, x - cx) + math.pi
+    def _build_masks(self, H: int, W: int, device: torch.device):
+        """生成半径索引、角度软分配权重、高频掩码"""
+        cy, cx = H // 2, W // 2
+        y, x = torch.meshgrid(torch.arange(H, device=device),
+                              torch.arange(W, device=device), indexing='ij')
+        r = torch.sqrt((y - cy) ** 2 + (x - cx) ** 2)
+        theta = torch.atan2(y - cy, x - cx) + math.pi   # [0, 2π)
 
-            angle_step = 2 * math.pi / self.n_angles
-            angle_idx = (theta / angle_step).floor().long() % self.n_angles
-            r_max = max(cy, cx) if max(cy, cx) > 0 else 1
-            high_freq_mask = (r > self.high_freq_ratio * r_max)
+        # 半径索引（均匀分区）
+        max_r = max(cy, cx)
+        n_radii = int(max_r // self.radius_width) + 1
+        radius_idx = torch.floor(r / self.radius_width).long().clamp(0, n_radii - 1)
 
-            self.angle_idx = angle_idx.unsqueeze(0).unsqueeze(0)   # [1,1,H,W]
-            self.high_freq_mask = high_freq_mask.unsqueeze(0).unsqueeze(0)
+        # 角度软分配（三角加权，覆盖 [0, π) 以保持对称性）
+        theta = theta % math.pi   # 映射到 [0, π)
+        delta = math.pi / self.n_angles
+        half_width = self.overlap_ratio * delta / 2.0
+        angle_weights = torch.zeros(self.n_angles, H, W, device=device)
+        for a in range(self.n_angles):
+            center = a * delta + delta / 2.0
+            dist = (theta - center).abs()
+            mask = dist < half_width
+            w = (1 - dist / half_width).clamp(min=0)
+            angle_weights[a] = w * mask.float()
+        sum_w = angle_weights.sum(dim=0, keepdim=True) + self.eps
+        angle_weights = angle_weights / sum_w
+
+        # 高频掩码（半径大于 high_freq_ratio * max_r 的点）
+        high_freq_mask = (r > self.high_freq_ratio * max_r)
+
+        # 缓存
+        self.radius_idx = radius_idx.unsqueeze(0).unsqueeze(0)   # [1,1,H,W]
+        self.angle_weights = angle_weights.unsqueeze(0)          # [1, n_angles, H, W]
+        self.high_freq_mask = high_freq_mask.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+        self._cached_HW = (H, W)
+        self._cached_n_radii = n_radii
+
+        # 调整权重的最后一维（半径数）
+        if self.weights.size(-1) != n_radii:
+            new_weights = torch.zeros(self.c_mid, self.n_angles, n_radii, device=device)
+            if isinstance(self.weights, nn.Parameter):
+                self.weights = nn.Parameter(new_weights)
+            else:
+                self.weights = new_weights
+
+        if self.use_hann_window and self._hann_window is None:
+            hann_1d = torch.hann_window(H, device=device)
+            hann_2d = hann_1d.unsqueeze(1) * torch.hann_window(W, device=device).unsqueeze(0)
+            self._hann_window = hann_2d.unsqueeze(0).unsqueeze(0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-        x_proj = self.proj_in(x)
+        device = x.device
 
-        self._set_masks(H, W, x.device)
-        a_idx = self.angle_idx.expand(B, self.c_mid, -1, -1)
-        hf_mask = self.high_freq_mask.expand(B, self.c_mid, -1, -1)
+        x_proj = self.proj_in(x)   # [B, c_mid, H, W]
 
+        if self.use_hann_window:
+            if self._hann_window is None or self._hann_window.shape[-2:] != (H, W):
+                self._build_masks(H, W, device)
+            x_proj = x_proj * self._hann_window
+
+        # FFT
         x_fft = torch.fft.fft2(x_proj, norm='ortho')
         x_fft_shift = torch.fft.fftshift(x_fft, dim=(-2, -1))
+        mag = x_fft_shift.abs() + self.eps
 
-        # 可学习权重，映射到 [1-gain_range, 1+gain_range]
-        raw = self.angle_weights[a_idx]               # [B,c_mid,H,W]
-        gain_angle = 1.0 + self.gain_range * torch.tanh(raw)   # 范围 [1-gr, 1+gr]
-        # 只在高频区域应用增益，低频保持1
-        gain = torch.where(hf_mask, gain_angle, torch.ones_like(gain_angle))
+        if self._cached_HW != (H, W):
+            self._build_masks(H, W, device)
 
-        x_fft_shift = x_fft_shift * gain
+        r_idx = self.radius_idx.expand(B, -1, H, W)          # [B,1,H,W]
+        aw = self.angle_weights.expand(B, -1, H, W)          # [B, n_angles, H, W]
+        hf_mask = self.high_freq_mask.expand(B, -1, H, W)    # [B,1,H,W] 高频掩码
 
-        x_fft_ishift = torch.fft.ifftshift(x_fft_shift, dim=(-2, -1))
+        n_radii = self._cached_n_radii
+
+        # 计算增益（先初始化为1，然后高频区域替换为学习到的增益）
+        gain = torch.ones(B, self.c_mid, H, W, device=device)
+
+        for c in range(self.c_mid):
+            w_c = self.weights[c]                     # [n_angles, n_radii]
+            # 对每个半径环独立处理
+            gain_c = torch.zeros(B, H, W, device=device)
+            for r in range(n_radii):
+                mask_r = (r_idx == r).float().squeeze(1)   # [B, H, W]
+                # 获取该半径环对应的角度权重（通过 soft 分配）
+                # 取 w_c 的第 r 列，形状 [n_angles]
+                w_r = w_c[:, r]                            # [n_angles]
+                # 计算每个空间位置的角度加权和
+                # aw: [B, n_angles, H, W], w_r: [n_angles] -> broadcast multiply
+                weighted_angle = (aw * w_r.view(1, -1, 1, 1)).sum(dim=1)  # [B, H, W]
+                gain_c = gain_c + weighted_angle * mask_r
+            # 应用高频掩码：高频区域用 gain_c，低频区域保持 1
+            # 注意：gain_c 初始值来自可学习权重，可能不是 1，需要先限制范围（可选）
+            if self.weight_range > 0:
+                # 通过 tanh 将权重的有效值限制在 [1-weight_range, 1+weight_range]
+                # 注意：gain_c 中的值来自 weights 的直接输出，weights 初始为0，所以初始 gain_c=0
+                # 但我们希望初始增益为1，所以需要加偏移和缩放
+                # 更简单：将 weights 作为缩放增量，gain_c = 1 + weight_range * tanh(original_gain)
+                # 但这里的 gain_c 是经过半径和角度聚合后的值，直接映射会破坏结构。
+                # 改为在权重加载后映射：先计算 raw_gain = gain_c，然后应用映射。
+                raw_gain = gain_c
+                gain_c = 1.0 + self.weight_range * torch.tanh(raw_gain)
+            # 高频区域使用 gain_c，低频区域保持1
+            gain_c_masked = torch.where(hf_mask.squeeze(1), gain_c, torch.ones_like(gain_c))
+            gain[:, c, :, :] = gain_c_masked
+
+        # 应用增益到幅度谱
+        mag_enhanced = mag * gain
+        x_fft_shift_enhanced = mag_enhanced * torch.exp(1j * torch.angle(x_fft_shift))
+
+        x_fft_ishift = torch.fft.ifftshift(x_fft_shift_enhanced, dim=(-2, -1))
         x_enh = torch.fft.ifft2(x_fft_ishift, norm='ortho').real
         x_enh = self.proj_out(x_enh)
 
-        return x + x_enh if self.residual else x_enh
+        if self.residual:
+            return x + x_enh
+        else:
+            return x_enh
 
 
 @ROTATED_NECKS.register_module()
@@ -91,8 +187,17 @@ class AngleFreqEnhanceFPN(FPN):
                  out_channels,
                  num_outs,
                  enhance_levels: List[int] = [0, 1, 2, 3],
-                 afe_cfg: dict = dict(n_angles=8, c_mid=16, high_freq_ratio=0.3,
-                                      gain_range=0.5),
+                 afe_cfg: dict = dict(
+                     c_mid=16,
+                     n_angles=8,
+                     radius_width=8,
+                     high_freq_ratio=0.8,
+                     overlap_ratio=1.5,
+                     learnable_weights=True,
+                     weight_range=0.5,
+                     residual=True,
+                     use_hann_window=False,
+                 ),
                  **kwargs):
         super().__init__(
             in_channels=in_channels,

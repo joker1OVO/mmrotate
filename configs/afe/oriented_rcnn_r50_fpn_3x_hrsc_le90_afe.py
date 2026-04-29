@@ -23,16 +23,19 @@ model = dict(
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
         num_outs=5,
-        enhance_levels=[3],  # 可只增强部分层级
+        enhance_levels=[0, 1, 2, 3],  # P2~P5 全增强
         afe_cfg=dict(
-            n_angles=8,  # 8个角度扇区
-            high_freq_ratio=0.3,  # 高频比例，直流/低频被排除
-            learnable_weights=True,
-            gain_range=0.2,  # 增益范围 [0.5, 1.5]
-            residual=True,
             c_mid=16,
+            n_angles=8,
+            radius_width=8,
+            high_freq_ratio=0.8,  # 只调制最外圈 20% 的高频区域
+            overlap_ratio=1.5,
+            learnable_weights=True,
+            weight_range=0.5,  # 增益范围 [0.5, 1.5]
+            residual=True,
+            use_hann_window=False,
         ),
-        start_level=0,  # 从 C2 开始
+        start_level=0,
         add_extra_convs='on_output',
         relu_before_extra_convs=True,
         norm_cfg=dict(type='BN', requires_grad=True)
