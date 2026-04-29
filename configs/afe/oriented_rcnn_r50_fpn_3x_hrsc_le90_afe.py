@@ -23,11 +23,11 @@ model = dict(
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
         num_outs=5,
-        enhance_levels=[0, 1, 2, 3],  # 可选，默认全增强
+        enhance_levels=[1, 2],  # 仅增强 P3 和 P4
         afe_cfg=dict(
-            n_angles=8,  # 8 个角度扇区
-            c_mid=16,  # 投影通道数，保持较小值
-            high_freq_ratio=0.3,  # 高频比例，0.3 表示半径 > 0.3*max_r 的区域被增强
+            n_angles=8,  # 使用 8 个角度扇区（默认是 8，不是 32）
+            c_mid=16,  # 16 通道投影，与原版一致
+            high_freq_ratio=0.3,  # 高频比例
             learnable_weights=True,
             enhance_init=1.0,
             residual=True,
@@ -177,4 +177,4 @@ data = dict(
 #     weight_decay=0.05)
 
 evaluation = dict(interval=1, metric='mAP', start=1)
-# optimizer = dict(lr=0.005)
+optimizer = dict(lr=0.005)
