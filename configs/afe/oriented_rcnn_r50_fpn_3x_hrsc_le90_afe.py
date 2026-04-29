@@ -25,13 +25,13 @@ model = dict(
         num_outs=5,
         enhance_levels=[0, 1, 2, 3],  # P2~P5 全增强
         afe_cfg=dict(
-            c_mid=16,
+            c_mid=128,
             n_angles=8,
             radius_width=8,
-            high_freq_ratio=0.8,  # 只调制最外圈 20% 的高频区域
+            high_freq_ratio=0.2,  # 只调制最外圈 20% 的高频区域
             overlap_ratio=1.5,
             learnable_weights=True,
-            weight_range=0.5,  # 增益范围 [0.5, 1.5]
+            weight_range=0.7,  # 增益范围 [0.5, 1.5]
             residual=True,
             use_hann_window=False,
         ),
