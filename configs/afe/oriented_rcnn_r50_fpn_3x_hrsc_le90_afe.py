@@ -25,16 +25,16 @@ model = dict(
         num_outs=5,
         enhance_levels=[0, 1, 2, 3],  # 对 P2~P5 都增强
         afe_cfg=dict(
-            n_angles=8,  # 角度扇区数（与原版一致）
-            high_freq_ratio=0.3,  # 高频比例
+            n_angles=8,  # 角度扇区数
+            high_freq_ratio=0.3,  # 高频比例（0 表示全频段）
             learnable_weights=True,
-            enhance_init=1.0,
             residual=True,
-            c_mid=16,
-            use_radius_groups=True,  # 开启半径分组
-            radius_width=8,  # 半径组宽度（像素），用于计算组数
-            n_radii=16,  # 也可直接指定半径组数（优先于 radius_width）
-        ),
+            c_mid=16,  # 中间通道数
+            radius_width=8,  # 半径组宽度（自动计算组数）
+            overlap_ratio=1.5,  # 角度重叠系数
+            use_hann_window=False,  # 是否加窗
+            out_clip=10.0,  # 输出裁剪阈值
+         ),
         start_level=1,
         add_extra_convs='on_output',
         relu_before_extra_convs=True,
