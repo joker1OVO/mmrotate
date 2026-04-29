@@ -1,4 +1,4 @@
-# angle_freq_enhance.py
+# angle_freq_enhance_fixed.py
 import math
 import torch
 import torch.nn as nn
@@ -10,7 +10,7 @@ from typing import List, Optional
 
 
 class AngleFreqEnhance(nn.Module):
-    """频域极坐标增强模块：均匀半径分区 + 重叠角度扇区 + 通道独立可学习权重"""
+    """频域极坐标增强模块（直流分量不增强）"""
 
     def __init__(self,
                  in_channels: int = 256,
@@ -62,6 +62,7 @@ class AngleFreqEnhance(nn.Module):
         n_radii = int(max_r // self.radius_width) + 1
         radius_idx = torch.floor(r / self.radius_width).long().clamp(0, n_radii - 1)
 
+        # 角度范围 [0, π) 保证对称性
         theta = theta % math.pi
         delta = math.pi / self.n_angles
         half_width = self.overlap_ratio * delta / 2.0
@@ -146,6 +147,11 @@ class AngleFreqEnhance(nn.Module):
                 gain_c += angle_sum * mask_r.squeeze(1)
             gain[:, c, :, :] = gain_c
 
+        # ========== 强制直流分量（中心点）增益为 1 ==========
+        center_h, center_w = H // 2, W // 2
+        gain[:, :, center_h, center_w] = 1.0
+        # =================================================
+
         mag_enhanced = mag * gain
         x_fft_shift_enhanced = mag_enhanced * torch.exp(1j * torch.angle(x_fft_shift))
 
@@ -176,7 +182,6 @@ class AngleFreqEnhanceFPN(FPN):
             num_outs=num_outs,
             **kwargs)
 
-        # 侧向层的数量（lateral_convs）由父类根据 start_level 和 in_channels 计算得出
         num_lateral = len(self.lateral_convs)
         self.afe_modules = nn.ModuleList()
         for i in range(num_lateral):
@@ -187,24 +192,20 @@ class AngleFreqEnhanceFPN(FPN):
 
     @auto_fp16()
     def forward(self, inputs):
-        # 侧向连接 + 频域增强
         laterals = []
         for i, lateral_conv in enumerate(self.lateral_convs):
             feat = lateral_conv(inputs[i + self.start_level])
             feat = self.afe_modules[i](feat)
             laterals.append(feat)
 
-        # 自顶向下融合（与原始 FPN 相同）
         used_backbone_levels = len(laterals)
         for i in range(used_backbone_levels - 1, 0, -1):
             prev_shape = laterals[i - 1].shape[2:]
             upsampled = F.interpolate(laterals[i], size=prev_shape, **self.upsample_cfg)
             laterals[i - 1] = laterals[i - 1] + upsampled
 
-        # 构建输出层
         outs = [self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)]
 
-        # 额外层（P6, P7 ...）
         if self.num_outs > len(outs):
             if not self.add_extra_convs:
                 for i in range(self.num_outs - used_backbone_levels):
@@ -225,8 +226,6 @@ class AngleFreqEnhanceFPN(FPN):
                     else:
                         outs.append(self.fpn_convs[i](outs[-1]))
 
-        # 确保输出层数与 num_outs 严格一致（防御性代码）
         assert len(outs) == self.num_outs, \
-            f"FPN outputs {len(outs)} levels but num_outs={self.num_outs}. " \
-            f"Check add_extra_convs, num_outs and backbone levels."
+            f"FPN outputs {len(outs)} levels but num_outs={self.num_outs}."
         return tuple(outs)
