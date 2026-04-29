@@ -1,4 +1,3 @@
-# afe_simple.py
 import math
 import torch
 import torch.nn as nn
@@ -35,7 +34,7 @@ class AngleFreqEnhance(nn.Module):
         nn.init.kaiming_normal_(self.proj_in.weight, mode='fan_out', nonlinearity='relu')
         nn.init.kaiming_normal_(self.proj_out.weight, mode='fan_out', nonlinearity='relu')
 
-        # 每个角度扇区一个可学习权重（形状: (c_mid, n_angles) 或 (n_angles) ？为保留通道差异性，形状 (c_mid, n_angles)）
+        # 每个角度扇区一个可学习权重（形状: (c_mid, n_angles)）
         if learnable_weights:
             self.angle_weights = nn.Parameter(torch.ones(c_mid, n_angles))
         else:
@@ -72,14 +71,17 @@ class AngleFreqEnhance(nn.Module):
         if self._cached_HW != (H, W):
             self._build_angle_mask(H, W, device)
 
-        # 扩展角度索引到 batch 和 c_mid 维度
-        angle_idx = self.angle_idx.expand(B, self.c_mid, H, W)  # [B, c_mid, H, W]
+        # angle_idx: [1,1,H,W] -> 扩展到 batch 维度 [B,1,H,W]
+        angle_idx = self.angle_idx.expand(B, -1, H, W)   # [B,1,H,W]
 
-        # 获取每个位置对应的角度权重（从 angle_weights 中 gather）
-        # angle_weights: [c_mid, n_angles]
-        # 扩展后变成 [B, c_mid, n_angles]，然后 gather 得到 [B, c_mid, H, W]
-        weights_expanded = self.angle_weights.unsqueeze(0).expand(B, -1, -1)  # [B, c_mid, n_angles]
-        gain = torch.gather(weights_expanded, dim=2, index=angle_idx)         # [B, c_mid, H, W]
+        # 计算增益 [B, c_mid, H, W]
+        gain = torch.zeros(B, self.c_mid, H, W, device=device)
+        for c in range(self.c_mid):
+            # w: [n_angles]
+            w = self.angle_weights[c]
+            # 使用高级索引：w[angle_idx] 得到形状 [B,1,H,W]，然后移除 channel 维度
+            gain_c = w[angle_idx]      # [B,1,H,W]
+            gain[:, c, :, :] = gain_c.squeeze(1)
 
         # 应用增益到幅度谱
         mag_enhanced = mag * gain
@@ -146,6 +148,20 @@ class AngleFreqEnhanceFPN(FPN):
                 for i in range(self.num_outs - used_backbone_levels):
                     outs.append(F.max_pool2d(outs[-1], 1, stride=2))
             else:
-                # 省略 extra convs 细节（与原 FPN 一致）
-                pass
+                # 如果使用 extra convs，简化处理：保持原逻辑但保持 num_outs 一致
+                if self.add_extra_convs == 'on_input':
+                    extra_source = inputs[self.backbone_end_level - 1]
+                elif self.add_extra_convs == 'on_lateral':
+                    extra_source = laterals[-1]
+                elif self.add_extra_convs == 'on_output':
+                    extra_source = outs[-1]
+                else:
+                    raise NotImplementedError
+                outs.append(self.fpn_convs[used_backbone_levels](extra_source))
+                for i in range(used_backbone_levels + 1, self.num_outs):
+                    if self.relu_before_extra_convs:
+                        outs.append(self.fpn_convs[i](F.relu(outs[-1])))
+                    else:
+                        outs.append(self.fpn_convs[i](outs[-1]))
+
         return tuple(outs)
