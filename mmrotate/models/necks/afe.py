@@ -1,3 +1,4 @@
+# afe_angle_minimal.py
 import math
 import torch
 import torch.nn as nn
@@ -10,95 +11,82 @@ from typing import List, Optional
 
 class AngleFreqEnhance(nn.Module):
     """
-    修复版：仅在高频区域按角度分组加权，低频和直流保持不变。
+    基于原版 afe7595 的修改：将半径分组改为角度分组。
+    - 权重形状 (n_angles,)
+    - 高频掩码保留
+    - 其他逻辑（投影、残差等）与原版一致
     """
 
     def __init__(self,
                  in_channels: int = 256,
-                 c_mid: int = 16,
                  n_angles: int = 8,
                  high_freq_ratio: float = 0.3,
                  learnable_weights: bool = True,
+                 enhance_init: float = 1.0,
                  residual: bool = True,
+                 c_mid: int = 16,
                  eps: float = 1e-8):
         super().__init__()
-        self.c_mid = c_mid
         self.n_angles = n_angles
         self.high_freq_ratio = high_freq_ratio
         self.residual = residual
+        self.c_mid = c_mid
         self.eps = eps
 
         self.proj_in = nn.Conv2d(in_channels, c_mid, kernel_size=1, bias=False)
         self.proj_out = nn.Conv2d(c_mid, in_channels, kernel_size=1, bias=False)
-        nn.init.kaiming_normal_(self.proj_in.weight, mode='fan_out', nonlinearity='relu')
-        nn.init.kaiming_normal_(self.proj_out.weight, mode='fan_out', nonlinearity='relu')
 
         if learnable_weights:
-            self.angle_weights = nn.Parameter(torch.ones(c_mid, n_angles))
+            self.angle_weights = nn.Parameter(torch.full((n_angles,), enhance_init))
         else:
-            self.register_buffer('angle_weights', torch.ones(c_mid, n_angles))
+            self.register_buffer('angle_weights', torch.full((n_angles,), enhance_init))
 
         self.register_buffer('angle_idx', None)
         self.register_buffer('high_freq_mask', None)
-        self._cached_HW = None
 
-    def _build_masks(self, H: int, W: int, device: torch.device):
-        cy, cx = H // 2, W // 2
-        y, x = torch.meshgrid(torch.arange(H, device=device),
-                              torch.arange(W, device=device), indexing='ij')
-        r = torch.sqrt((y - cy) ** 2 + (x - cx) ** 2)
-        theta = torch.atan2(y - cy, x - cx) + math.pi
+    def _set_masks(self, H: int, W: int, device: torch.device):
+        if self.angle_idx is None or self.angle_idx.shape[-2:] != (H, W):
+            cy, cx = H // 2, W // 2
+            y, x = torch.meshgrid(torch.arange(H, device=device),
+                                  torch.arange(W, device=device), indexing='ij')
+            r = torch.sqrt((y - cy) ** 2 + (x - cx) ** 2)
+            theta = torch.atan2(y - cy, x - cx) + math.pi
 
-        max_r = max(cy, cx)
-        high_freq_mask = (r > self.high_freq_ratio * max_r)
+            # 角度分组索引（均匀划分）
+            angle_step = 2 * math.pi / self.n_angles
+            angle_idx = (theta / angle_step).floor().long() % self.n_angles
 
-        angle_step = 2 * math.pi / self.n_angles
-        angle_idx = (theta / angle_step).floor().long() % self.n_angles
+            # 高频掩码（与原版相同）
+            r_max = max(cy, cx) if max(cy, cx) > 0 else 1
+            high_freq_mask = (r > self.high_freq_ratio * r_max)
 
-        self.angle_idx = angle_idx.unsqueeze(0).unsqueeze(0)   # [1,1,H,W]
-        self.high_freq_mask = high_freq_mask.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
-        self._cached_HW = (H, W)
+            self.angle_idx = angle_idx.unsqueeze(0).unsqueeze(0)   # [1,1,H,W]
+            self.high_freq_mask = high_freq_mask.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-        device = x.device
+        x_proj = self.proj_in(x)
 
-        x_proj = self.proj_in(x)   # [B, c_mid, H, W]
+        self._set_masks(H, W, x.device)
 
-        if self._cached_HW != (H, W):
-            self._build_masks(H, W, device)
+        # 扩展掩码到 batch 和 c_mid 通道
+        a_idx = self.angle_idx.expand(B, self.c_mid, -1, -1)   # [B, c_mid, H, W]
+        hf_mask = self.high_freq_mask.expand(B, self.c_mid, -1, -1)
 
         x_fft = torch.fft.fft2(x_proj, norm='ortho')
         x_fft_shift = torch.fft.fftshift(x_fft, dim=(-2, -1))
-        mag = x_fft_shift.abs() + self.eps
 
-        # 角度索引和高频掩码
-        angle_idx = self.angle_idx.expand(B, self.c_mid, H, W)   # [B, c_mid, H, W]
-        hf_mask = self.high_freq_mask.expand(B, 1, H, W)         # [B,1,H,W]
+        # 应用角度权重（与原版相同的 torch.where 逻辑）
+        weights = self.angle_weights[a_idx]   # [B, c_mid, H, W]
+        gain = torch.where(hf_mask, weights, torch.ones_like(weights))
 
-        # 获取增益：只对高频区域应用角度权重，低频区域增益=1
-        # 方法：先初始化为全1，然后在高频区域用角度权重替换
-        gain = torch.ones(B, self.c_mid, H, W, device=device)
-        # 对于每个通道，从 angle_weights 中取对应的权重
-        for c in range(self.c_mid):
-            # 取出该通道的角度权重向量 [n_angles]
-            w = self.angle_weights[c]  # [n_angles]
-            # 根据 angle_idx 取值，得到 [B, H, W]
-            gain_c = w[angle_idx[:, c, :, :]]  # 注意 angle_idx 是 [B, c_mid, H, W]
-            # 应用高频掩码：高频区域使用 gain_c，低频区域保持1
-            gain_c = torch.where(hf_mask.squeeze(1), gain_c, torch.ones_like(gain_c))
-            gain[:, c, :, :] = gain_c
+        x_fft_shift = x_fft_shift * gain
 
-        mag_enhanced = mag * gain
-        x_fft_shift_enhanced = mag_enhanced * torch.exp(1j * torch.angle(x_fft_shift))
-        x_fft_ishift = torch.fft.ifftshift(x_fft_shift_enhanced, dim=(-2, -1))
+        x_fft_ishift = torch.fft.ifftshift(x_fft_shift, dim=(-2, -1))
         x_enh = torch.fft.ifft2(x_fft_ishift, norm='ortho').real
         x_enh = self.proj_out(x_enh)
 
-        if self.residual:
-            return x + x_enh
-        else:
-            return x_enh
+        return x + x_enh if self.residual else x_enh
 
 
 @ROTATED_NECKS.register_module()
@@ -107,20 +95,19 @@ class AngleFreqEnhanceFPN(FPN):
                  in_channels,
                  out_channels,
                  num_outs,
-                 enhance_levels: Optional[List[int]] = None,
-                 afe_cfg: dict = dict(c_mid=16, n_angles=8, high_freq_ratio=0.3,
-                                      learnable_weights=True, residual=True),
+                 enhance_levels: List[int] = [0, 1, 2, 3],
+                 afe_cfg: dict = dict(n_angles=8, c_mid=16, high_freq_ratio=0.3),
                  **kwargs):
-        super().__init__(
+        super(AngleFreqEnhanceFPN, self).__init__(
             in_channels=in_channels,
             out_channels=out_channels,
             num_outs=num_outs,
             **kwargs)
 
-        num_lateral = len(self.lateral_convs)
+        self.enhance_levels = enhance_levels
         self.afe_modules = nn.ModuleList()
-        for i in range(num_lateral):
-            if enhance_levels is None or i in enhance_levels:
+        for i in range(len(in_channels)):
+            if i in enhance_levels:
                 self.afe_modules.append(AngleFreqEnhance(in_channels=out_channels, **afe_cfg))
             else:
                 self.afe_modules.append(nn.Identity())

@@ -23,12 +23,13 @@ model = dict(
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
         num_outs=5,
-        enhance_levels=[1, 2],  # 先只增强 P3,P4
+        enhance_levels=[1, 2],  # 限制在 P3,P4 测试
         afe_cfg=dict(
-            c_mid=16,
             n_angles=8,
+            c_mid=16,
             high_freq_ratio=0.3,
             learnable_weights=True,
+            enhance_init=1.0,
             residual=True,
         ),
         start_level=1,
