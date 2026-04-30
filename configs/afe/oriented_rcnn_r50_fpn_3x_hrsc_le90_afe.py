@@ -25,13 +25,13 @@ model = dict(
         num_outs=5,
         enhance_levels=[0, 1, 2, 3],  # P2~P5 全增强
         afe_cfg=dict(
-            c_mid=128,
+            c_mid=64,
             n_angles=8,
             radius_width=8,
-            high_freq_ratio=0.2,  # 只调制最外圈 20% 的高频区域
+            high_freq_ratio=0.3,  # 只调制最外圈 20% 的高频区域
             overlap_ratio=1.5,
             learnable_weights=True,
-            weight_range=0.7,  # 增益范围 [0.5, 1.5]
+            weight_range=0.4,  # 增益范围 [0.5, 1.5]
             residual=True,
             use_hann_window=False,
         ),
@@ -172,12 +172,12 @@ data = dict(
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 
-# optimizer = dict(
-#     _delete_=True,
-#     type='AdamW',
-#     lr=0.0004,
-#     betas=(0.9, 0.999),
-#     weight_decay=0.05)
+optimizer = dict(
+    _delete_=True,
+    type='AdamW',
+    lr=0.0004,
+    betas=(0.9, 0.999),
+    weight_decay=0.05)
 
-evaluation = dict(interval=1, metric='mAP', start=1)
-optimizer = dict(lr=0.005)
+evaluation = dict(interval=1, metric='mAP', start=33)
+# optimizer = dict(lr=0.005)
