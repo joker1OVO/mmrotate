@@ -20,10 +20,13 @@ model = dict(
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
         type='EFC_FPN',
-        in_channels=[256, 512, 1024, 2048],
+        in_channels=[256, 512, 1024, 2048],  # 根据你的 backbone 调整
         out_channels=256,
-        # num_outs=5
-        ),
+        num_outs=5,
+        start_level=0,
+        end_level=3,
+        group_num=16
+    ),
     rpn_head=dict(
         type='OrientedRPNHead',
         in_channels=256,
