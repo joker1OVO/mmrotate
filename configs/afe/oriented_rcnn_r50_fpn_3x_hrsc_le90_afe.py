@@ -156,12 +156,12 @@ data = dict(
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 
-optimizer = dict(
-    _delete_=True,
-    type='AdamW',
-    lr=0.0004,
-    betas=(0.9, 0.999),
-    weight_decay=0.05)
+# optimizer = dict(
+#     _delete_=True,
+#     type='AdamW',
+#     lr=0.0004,
+#     betas=(0.9, 0.999),
+#     weight_decay=0.05)
 
 evaluation = dict(interval=1, metric='mAP', start=33)
-# optimizer = dict(lr=0.005)
+optimizer = dict(lr=0.005)
