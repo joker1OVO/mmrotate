@@ -1,144 +1,185 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mmcv.cnn import ConvModule
 from mmcv.runner import BaseModule, auto_fp16
+from mmdet.models.builder import NECKS
 
-from ..builder import ROTATED_NECKS
-
-class EFC(BaseModule):
-    def __init__(self,
-                 c1, c2
-                 ):
+class GFF(BaseModule):
+    """分组特征聚焦单元"""
+    def __init__(self, in_channels, out_channels, group_num=16, eps=1e-5):
         super().__init__()
-        self.conv1 = nn.Conv2d(c1, c2, kernel_size=1, stride=1)
-        self.conv2 = nn.Conv2d(c2, c2, kernel_size=1, stride=1)
-        self.conv4 = nn.Conv2d(c2, c2, kernel_size=1, stride=1)
-        self.bn = nn.BatchNorm2d(c2)
-        self.sigomid = nn.Sigmoid()
-        self.group_num = 16
-        self.eps = 1e-10
-        self.gamma = nn.Parameter(torch.randn(c2, 1, 1))
-        self.beta = nn.Parameter(torch.zeros(c2, 1, 1))
-        self.gate_genator = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Conv2d(c2, c2, 1, 1),
-            nn.ReLU(True),
-            nn.Softmax(dim=1),
+        self.group_num = group_num
+        self.eps = eps
+
+        # 对齐低分辨率特征：先上采样到高分辨率尺寸，再1x1调整通道
+        self.align_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1)
         )
-        self.dwconv = nn.Conv2d(c2, c2, kernel_size=3, stride=1, padding=1, groups=c2)
-        self.conv3 = nn.Conv2d(c2, c2, kernel_size=1, stride=1)
-        self.Apt = nn.AdaptiveAvgPool2d(1)
-        self.one = c2
-        self.two = c2
-        self.conv4_gobal = nn.Conv2d(c2, 1, kernel_size=1, stride=1)
-        for group_id in range(0, 4):
-            self.interact = nn.Conv2d(c2 // 4, c2 // 4, 1, 1, )
+        # 空间注意力权重生成
+        self.spatial_att = nn.Sequential(
+            nn.Conv2d(out_channels, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+        # 分组交互卷积 (每组一个1x1)
+        self.group_interact = nn.ModuleList([
+            nn.Conv2d(out_channels // group_num, out_channels // group_num, kernel_size=1)
+            for _ in range(group_num)
+        ])
+        # 可学习的仿射参数
+        self.gamma = nn.Parameter(torch.ones(out_channels, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(out_channels, 1, 1))
 
-    def forward(self, x):
-        x1, x2 = x
-        global_conv1 = self.conv1(x1)
-        bn_x = self.bn(global_conv1)
-        weight_1 = self.sigomid(bn_x)
-        global_conv2 = self.conv2(x2)
-        bn_x2 = self.bn(global_conv2)
-        weight_2 = self.sigomid(bn_x2)
-        X_GOBAL = global_conv1 + global_conv2
-        x_conv4 = self.conv4_gobal(X_GOBAL)
-        X_4_sigmoid = self.sigomid(x_conv4)
-        X_ = X_4_sigmoid * X_GOBAL
-        X_ = X_.chunk(4, dim=1)
-        out = []
-        for group_id in range(0, 4):
-            out_1 = self.interact(X_[group_id])
-            N, C, H, W = out_1.size()
-            x_1_map = out_1.reshape(N, 1, -1)
-            mean_1 = x_1_map.mean(dim=2, keepdim=True)
-            x_1_av = x_1_map / mean_1
-            x_2_2 = F.softmax(x_1_av, dim=-1)
-            x1 = x_2_2.reshape(N, C, H, W)
-            x1 = X_[group_id] * x1
-            out.append(x1)
-        out = torch.cat([out[0], out[1], out[2], out[3]], dim=1)
-        N, C, H, W = out.size()
-        x_add_1 = out.reshape(N, self.group_num, -1)
-        N, C, H, W = X_GOBAL.size()
-        x_shape_1 = X_GOBAL.reshape(N, self.group_num, -1)
-        mean_1 = x_shape_1.mean(dim=2, keepdim=True)
-        std_1 = x_shape_1.std(dim=2, keepdim=True)
-        x_guiyi = (x_add_1 - mean_1) / (std_1 + self.eps)
-        x_guiyi_1 = x_guiyi.reshape(N, C, H, W)
-        x_gui = (x_guiyi_1 * self.gamma + self.beta)
-        weight_x3 = self.Apt(X_GOBAL)
-        reweights = self.sigomid(weight_x3)
-        x_up_1 = reweights >= weight_1
-        x_low_1 = reweights < weight_1
-        x_up_2 = reweights >= weight_2
-        x_low_2 = reweights < weight_2
-        x_up = x_up_1 * X_GOBAL + x_up_2 * X_GOBAL
-        x_low = x_low_1 * X_GOBAL + x_low_2 * X_GOBAL
-        x11_up_dwc = self.dwconv(x_low)
-        x11_up_dwc = self.conv3(x11_up_dwc)
-        x_so = self.gate_genator(x_low)
-        x11_up_dwc = x11_up_dwc * x_so
-        x22_low_pw = self.conv4(x_up)
-        xL = x11_up_dwc + x22_low_pw
-        xL = xL + x_gui
+    def forward(self, low_feat, high_feat):
+        # low_feat: 深层特征, high_feat: 浅层特征（空间尺寸更大）
+        # 动态上采样 low_feat 到 high_feat 的尺寸
+        target_h, target_w = high_feat.shape[2], high_feat.shape[3]
+        low_up = F.interpolate(low_feat, size=(target_h, target_w), mode='nearest')
+        low_aligned = self.align_conv(low_up)           # 调整通道
 
-        return xL
+        coarse = low_aligned + high_feat                # 粗融合
+        spatial_weight = self.spatial_att(coarse)       # 空间权重
+        focused = coarse * spatial_weight               # 空间聚焦
+
+        N, C, H, W = focused.shape
+        g_c = C // self.group_num
+        groups = focused.chunk(self.group_num, dim=1)   # 分组
+
+        outs = []
+        for i, g in enumerate(groups):
+            interacted = self.group_interact[i](g)
+            # 空间Softmax注意力（基于分组内通道均值）
+            att = F.softmax(interacted.mean(dim=1, keepdim=True).view(N,1,-1), dim=-1)
+            att = att.view(N,1,H,W)
+            outs.append(g * att)
+        fused = torch.cat(outs, dim=1)
+
+        # 使用 coarse 的均值和标准差进行归一化
+        flat = coarse.view(N, C, -1)
+        mean = flat.mean(dim=-1, keepdim=True).view(N,C,1,1)
+        std = flat.std(dim=-1, keepdim=True).view(N,C,1,1)
+        normalized = (fused - mean) / (std + self.eps)
+        out = normalized * self.gamma + self.beta
+        return out
 
 
-class Maxpoll(BaseModule):  # 串联
-    def __init__(self, dim, dim_out):
+class MFR(BaseModule):
+    """多级特征重建模块"""
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.conv1 = nn.AvgPool2d(kernel_size=3, stride=2, padding=3 // 2)
-        self.conv3 = nn.MaxPool2d(kernel_size=3, stride=2, padding=3 // 2)
-        self.conv2 = nn.Conv2d(2 * dim, dim_out, 1, 1)
+        # 阈值预测器
+        self.threshold_conv = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+        # 弱特征轻量变换 (深度可分离 + 通道注意力)
+        self.dwconv = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels)
+        self.pwconv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        self.gate_gen = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, in_channels, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Softmax(dim=1)
+        )
+        # 强特征变换 (1x1)
+        self.strong_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        self.fusion_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1)
 
-    def forward(self, x):
-        x1 = self.conv1(x)
-        x2 = self.conv3(x)
-        x3 = torch.cat([x1, x2], dim=1)
-        x4 = self.conv2(x3)
-        return x4
+    def forward(self, x1, x2):
+        coarse = x1 + x2
+        T = self.threshold_conv(coarse)              # 阈值
+        w1, w2 = torch.sigmoid(x1), torch.sigmoid(x2)  # 重要性权重
+        strong = (w1 >= T).float() * coarse + (w2 >= T).float() * coarse
+        weak   = (w1 < T).float() * coarse + (w2 < T).float() * coarse
+
+        # 弱特征变换
+        weak_t = self.dwconv(weak)
+        weak_t = self.pwconv(weak_t)
+        gate = self.gate_gen(weak)                   # 通道注意力
+        weak_t = weak_t * gate
+
+        # 强特征变换
+        strong_t = self.strong_conv(strong)
+
+        out = weak_t + strong_t
+        out = self.fusion_conv(out)
+        return out
 
 
-@ROTATED_NECKS.register_module()
+@NECKS.register_module()
 class EFC_FPN(BaseModule):
+    """EFC特征金字塔（替换FPN）"""
     def __init__(self,
                  in_channels,
                  out_channels,
-                 ):
-        super(EFC_FPN, self).__init__()
-        self.P5_1 = nn.Conv2d(in_channels[3], out_channels, kernel_size=1, stride=1, padding=0)
-        self.P5_upsampled = nn.Upsample(scale_factor=2, mode='nearest')
-        self.P5_2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
-        self.P4_upsampled = nn.Upsample(scale_factor=2, mode='nearest')
-        self.efc1 = EFC(in_channels[2], out_channels)
-        self.efc2 = EFC(in_channels[1], out_channels)
-        self.efc3 = EFC(out_channels, out_channels)
-        self.efc4 = EFC(out_channels, out_channels)
-        self.P6 = Maxpoll(out_channels, out_channels)
-        self.P7 = Maxpoll(out_channels, out_channels)
-        self.down_one = Maxpoll(out_channels, out_channels)
-        self.down_two = Maxpoll(out_channels, out_channels)
+                 num_outs=5,
+                 start_level=0,
+                 end_level=-1,
+                 group_num=16):
+        super().__init__()
+        self.num_outs = num_outs
+        self.start_level = start_level
+        self.end_level = end_level if end_level != -1 else len(in_channels)-1
+        self.num_ins = len(in_channels)
+
+        # 横向卷积：将backbone各层通道对齐到 out_channels
+        self.lateral_convs = nn.ModuleList([
+            nn.Conv2d(in_channels[i], out_channels, 1)
+            for i in range(self.start_level, self.end_level+1)
+        ])
+
+        # GFF 模块（用于自上而下的相邻层融合）
+        self.gff_modules = nn.ModuleList([
+            GFF(out_channels, out_channels, group_num)
+            for _ in range(self.end_level - self.start_level)
+        ])
+        # MFR 模块（可选，与GFF并行）
+        self.mfr_modules = nn.ModuleList([
+            MFR(out_channels, out_channels)
+            for _ in range(self.end_level - self.start_level)
+        ])
+
+        # 额外输出层（P6, P7）
+        self.extra_convs = nn.ModuleList()
+        for _ in range(num_outs - (self.end_level - self.start_level + 1)):
+            self.extra_convs.append(
+                nn.Sequential(
+                    nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+                    nn.Conv2d(out_channels, out_channels, kernel_size=1)
+                )
+            )
 
     @auto_fp16()
     def forward(self, inputs):
-        """Forward function."""
+        # inputs: (C2, C3, C4, C5) 高分辨率 -> 低分辨率
+        laterals = []
+        for i, conv in enumerate(self.lateral_convs):
+            laterals.append(conv(inputs[self.start_level + i]))
 
-        C2, C3, C4, C5 = inputs
-        P5_x = self.P5_1(C5)  # 512-256  10
-        P5_x = self.P5_2(P5_x)  # 256-256  10
-        P5_upsampled_x = self.P5_upsampled(P5_x)  # 256  20
-        P4_x = self.efc1([C4, P5_upsampled_x])  # 256  20
-        P4_upsampled_x = self.P4_upsampled(P4_x)  # 256  40
-        P3_x = self.efc2([C3, P4_upsampled_x])
-        P_down1 = self.down_one(P3_x)
-        P_4 = self.efc3([P4_x, P_down1])
-        P_down2 = self.down_two(P_4)
-        P_5 = self.efc4([P5_x, P_down2])
-        P6_x = self.P6(P_5)
-        P7_x = self.P7(P6_x)
+        # 自上而下融合
+        out_list = []
+        prev = laterals[-1]          # 最顶层（最小分辨率）
+        out_list.append(prev)
 
-        return [P3_x, P_4, P_5, P6_x, P7_x]
+        # 从顶层向下遍历
+        idx = len(laterals) - 2
+        gff_idx = len(self.gff_modules) - 1
+        while idx >= 0:
+            cur = laterals[idx]
+            # 上采样 prev 到 cur 的空间尺寸
+            prev_up = F.interpolate(prev, size=cur.shape[2:], mode='nearest')
+            gff_out = self.gff_modules[gff_idx](prev_up, cur)   # 注意顺序：low_feat, high_feat
+            mfr_out = self.mfr_modules[gff_idx](gff_out, cur)
+            fused = gff_out + mfr_out
+            out_list.insert(0, fused)
+            prev = fused
+            idx -= 1
+            gff_idx -= 1
+
+        # 生成额外输出层（P6, P7）
+        extra_outs = []
+        for conv in self.extra_convs:
+            prev = conv(prev)
+            extra_outs.append(prev)
+
+        return tuple(out_list + extra_outs)
