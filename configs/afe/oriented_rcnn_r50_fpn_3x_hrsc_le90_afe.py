@@ -23,7 +23,7 @@ model = dict(
         # 修复点：把 64 开头改成 256 开头
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
-        num_outs=4,
+        num_outs=5,
         start_level=0,
         end_level=-1,
         conv_cfg=None,
