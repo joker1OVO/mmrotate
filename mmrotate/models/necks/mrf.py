@@ -56,7 +56,7 @@ class mrf(BaseModule):
         self.upsample_cfg = upsample_cfg.copy()
 
         assert len(in_channels) == 4, "需要4个输入特征层 [C2, C3, C4, C5]"
-        assert num_outs == 4, "输出必须为4层 [P2, P3, P4, P5]"
+        assert num_outs == 5, "输出必须为4层 [P2, P3, P4, P5]"
 
         if end_level == -1:
             self.backbone_end_level = self.num_ins
