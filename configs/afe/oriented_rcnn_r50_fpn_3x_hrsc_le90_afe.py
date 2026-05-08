@@ -18,18 +18,10 @@ model = dict(
         norm_eval=True,
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
-    neck=dict(
-        type='mrf',
-        # 修复点：把 64 开头改成 256 开头
-        in_channels=[256, 512, 1024, 2048],
+    neck=mrf(
+        in_channels=[256, 512, 1024, 2048],  # 对应 C2~C5
         out_channels=256,
-        num_outs=5,
-        start_level=0,
-        end_level=-1,
-        conv_cfg=None,
-        norm_cfg=dict(type='BN', requires_grad=True),
-        act_cfg=dict(type='ReLU'),
-        upsample_cfg=dict(mode='nearest')
+        num_outs=5
     ),
     rpn_head=dict(
         type='OrientedRPNHead',
