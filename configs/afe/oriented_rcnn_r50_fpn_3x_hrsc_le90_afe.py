@@ -18,7 +18,8 @@ model = dict(
         norm_eval=True,
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
-    neck=mrf(
+    neck=dict(
+        type='mrf',
         in_channels=[256, 512, 1024, 2048],  # 对应 C2~C5
         out_channels=256,
         num_outs=5
