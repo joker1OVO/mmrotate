@@ -19,12 +19,17 @@ model = dict(
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
-        type='EFC_FPN',
-        in_channels=[256, 512, 1024, 2048],  # 根据你的 backbone 实际输出调整
-        out_channels=256,
-        num_outs=5,
-        start_level=0,  # 通常从 C3 开始（索引1），C2 分辨率太高可不参与
-        group_num=16
+        type='SSPAFPN',          # 关键：使用你修改后的类名
+        in_channels=[256, 512, 1024, 2048],  # ResNet 输出通道
+        out_channels=256,        # FPN 输出通道数
+        num_outs=5,              # 输出特征层数，包括 P2~P5 以及额外的 P6
+        start_level=0,           # 从 C2 开始（索引 0）
+        end_level=-1,            # 使用所有 backbone 输出
+        add_extra_convs='on_output',  # 在最终输出上添加额外卷积生成 P6
+        relu_before_extra_convs=True,
+        norm_cfg=dict(type='BN', requires_grad=True),
+        act_cfg=dict(type='ReLU'),
+        # 可选：upsample_cfg 默认是 mode='nearest'，一般不需要改
     ),
     rpn_head=dict(
         type='OrientedRPNHead',
