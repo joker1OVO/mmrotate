@@ -19,10 +19,18 @@ model = dict(
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
-        type='FPN',
-        in_channels=[256, 512, 1024, 2048],
-        out_channels=256,
-        num_outs=5),
+        type='mrf',  # 对应代码中 @ROTATED_NECKS.register_module() 注册的类名
+        in_channels=[64, 128, 256, 512],  # 输入通道（需匹配backbone输出的C2/C3/C4/C5通道）
+        out_channels=256,  # 输出通道（固定为256，与代码中逻辑一致）
+        num_outs=4,  # 输出层数（固定为4，对应P2/P3/P4/P5）
+        start_level=0,  # 起始层索引（从第0层开始，对应C2）
+        end_level=-1,  # 结束层索引（-1表示到最后一层，即C5）
+        no_norm_on_lateral=False,  # 侧向卷积是否禁用归一化
+        conv_cfg=None,  # 卷积配置（默认普通卷积，可改为dict(type='Conv2d')）
+        norm_cfg=dict(type='BN', requires_grad=True),  # 归一化配置（BN/ SyncBN等）
+        act_cfg=dict(type='ReLU'),  # 激活函数配置
+        upsample_cfg=dict(mode='nearest')  # 上采样方式（nearest/ bilinear等）
+    ),
     rpn_head=dict(
         type='OrientedRPNHead',
         in_channels=256,
