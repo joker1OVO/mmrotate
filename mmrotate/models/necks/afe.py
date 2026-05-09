@@ -83,27 +83,29 @@ class DynamicDirectionalConv(nn.Module):
         mid = self.mid_channels
 
         x_low = self.reduce(x)   # [B, mid, H, W]
-
+        assert not torch.isnan(x_low).any(), "NaN in x_low after reduce"
         # 计算角度图（在低维特征上）
         angle_fft = compute_angle_map(x_low, window_size=k, stride=self.stride)
         angle = angle_fft + self.angle_bias
         angle = angle % math.pi
-
+        assert not torch.isnan(angle).any(), "NaN in angle (after bias and mod)"
         # 滑窗获取 patches
         x_pad = F.pad(x_low, (pad, pad, pad, pad), mode='reflect')
-        patches = F.unfold(x_pad, kernel_size=k, stride=self.stride)   # [B, mid*k*k, N]
+        patches = F.unfold(x_pad, kernel_size=k, stride=self.stride)
         N = patches.shape[-1]
-        patches = patches.view(B, mid, k*k, N).permute(0, 1, 3, 2)     # [B, mid, N, k*k]
+        patches = patches.view(B, mid, k * k, N).permute(0, 1, 3, 2)
+        patches_img = patches.permute(0, 2, 1, 3).reshape(B * N, mid, k, k)
+        assert not torch.isnan(patches_img).any(), "NaN in patches_img"
 
         # 恢复成图像形式 [B*N, mid, k, k]
         patches_img = patches.permute(0, 2, 1, 3).reshape(B*N, mid, k, k)
 
-        # 构建仿射变换，旋转每个 patch
-        angle_flat = angle.reshape(-1)          # [B*N]
+        # 构建仿射变换，旋转 patch
+        angle_flat = angle.reshape(-1)
         cos_t = torch.cos(angle_flat)
         sin_t = torch.sin(angle_flat)
         center = (k - 1) / 2.0
-        theta_affine = torch.zeros(B*N, 2, 3, device=device)
+        theta_affine = torch.zeros(B * N, 2, 3, device=device)
         theta_affine[:, 0, 0] = cos_t
         theta_affine[:, 0, 1] = -sin_t
         theta_affine[:, 0, 2] = center - cos_t * center + sin_t * center
@@ -113,15 +115,18 @@ class DynamicDirectionalConv(nn.Module):
 
         grid = F.affine_grid(theta_affine, patches_img.size(), align_corners=False)
         patches_rot = F.grid_sample(patches_img, grid, mode='bilinear',
-                                    padding_mode='zeros', align_corners=False)   # [B*N, mid, k, k]
+                                    padding_mode='zeros', align_corners=False)
+        assert not torch.isnan(patches_rot).any(), "NaN in patches_rot after grid_sample"
 
         # 深度卷积
-        out_conv = F.conv2d(patches_rot, self.fixed_kernel, groups=mid)   # [B*N, mid, 1, 1]
-        out_conv = out_conv.view(B, N, mid)          # [B, N, mid]
-        out_conv = out_conv.permute(0, 2, 1)        # [B, mid, N]
+        out_conv = F.conv2d(patches_rot, self.fixed_kernel, groups=mid)
+        assert not torch.isnan(out_conv).any(), "NaN in out_conv after depthwise conv"
 
+        out_conv = out_conv.view(B, N, mid).permute(0, 2, 1)
         out_low = out_conv.view(B, mid, H, W)
         out = self.expand(out_low)
+        assert not torch.isnan(out).any(), "NaN in final out after expand"
+
         return out
 
 
