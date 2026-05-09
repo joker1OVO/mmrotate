@@ -55,9 +55,6 @@ def compute_angle_map(x, window_size=7, stride=1):
     return angle_map
 
 class DynamicDirectionalConv(nn.Module):
-    """
-    方向性卷积模块，支持可配置的 mid_channels 和 kernel_size
-    """
     def __init__(self, in_channels, mid_channels=16, kernel_size=7, stride=1, padding=None):
         super().__init__()
         self.in_channels = in_channels
@@ -71,61 +68,87 @@ class DynamicDirectionalConv(nn.Module):
         self.reduce = nn.Conv2d(in_channels, mid_channels, 1, bias=False)
         self.expand = nn.Conv2d(mid_channels, in_channels, 1, bias=False)
         self.angle_bias = nn.Parameter(torch.tensor(0.0))
-        self.fixed_kernel = nn.Parameter(
-            torch.randn(mid_channels, 1, kernel_size, kernel_size) * 0.01
+
+        # 可学习的基础卷积核（深度卷积形式）
+        # 初始化：高斯平滑核，有助于稳定性
+        self.base_kernel = nn.Parameter(
+            self._create_gaussian_kernel(kernel_size, sigma=0.5).repeat(mid_channels, 1, 1, 1)
         )
 
+    def _create_gaussian_kernel(self, k, sigma):
+        ax = torch.linspace(-(k//2), k//2, k)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        kernel = torch.exp(-(xx**2 + yy**2) / (2*sigma**2))
+        kernel = kernel / kernel.sum()
+        return kernel.unsqueeze(0).unsqueeze(0)  # [1,1,k,k]
+
+    def _rotate_kernel(self, kernel, angle):
+        """
+        kernel: [mid, 1, k, k]
+        angle: scalar Tensor
+        Returns: rotated kernel of same shape
+        """
+        mid, _, k, _ = kernel.shape
+        device = kernel.device
+        center = (k - 1) / 2.0
+        cos_a = torch.cos(angle)
+        sin_a = torch.sin(angle)
+        # 仿射矩阵（逆时针旋转）
+        theta = torch.tensor([
+            [cos_a, -sin_a, center - cos_a*center + sin_a*center],
+            [sin_a,  cos_a, center - sin_a*center - cos_a*center]
+        ], device=device).unsqueeze(0)  # [1,2,3]
+        # kernel 形状 [mid, 1, k, k] -> 扩展 batch 维 [mid, 1, k, k] 需要 unsqueeze(0) 变成 [1, mid, 1, k, k]
+        # 但 grid_sample 要求输入 [N, C, H, W]，这里 N=mid, C=1, H=W=k
+        # 所以将 mid 视为 batch 维度
+        kernel_4d = kernel.view(mid, 1, k, k)  # [mid, 1, k, k]
+        grid = F.affine_grid(theta.expand(mid, -1, -1), kernel_4d.size(), align_corners=False)
+        rotated = F.grid_sample(kernel_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+        return rotated  # [mid, 1, k, k]
+
     def forward(self, x):
-        assert not torch.isnan(x).any(), "NaN in input x"
         B, C, H, W = x.shape
         device = x.device
         k = self.kernel_size
         pad = self.padding
         mid = self.mid_channels
-        assert not torch.isnan(self.reduce.weight).any(), "NaN in reduce.weight"
-        x_low = self.reduce(x)   # [B, mid, H, W]
-        assert not torch.isnan(x_low).any(), "NaN in x_low after reduce"
-        # 计算角度图（在低维特征上）
+
+        # 1. 降维
+        x_low = self.reduce(x)  # [B, mid, H, W]
+
+        # 2. 计算角度图（借用原有方法，它是在低维特征上计算）
         angle_fft = compute_angle_map(x_low, window_size=k, stride=self.stride)
         angle = angle_fft + self.angle_bias
         angle = angle % math.pi
-        assert not torch.isnan(angle).any(), "NaN in angle (after bias and mod)"
-        # 滑窗获取 patches
+        # 限制角度范围，避免过大偏移
+        angle = torch.clamp(angle, 0, math.pi - 1e-6)
+
+        # 3. 获取 patches
         x_pad = F.pad(x_low, (pad, pad, pad, pad), mode='reflect')
-        patches = F.unfold(x_pad, kernel_size=k, stride=self.stride)
-        N = patches.shape[-1]
-        patches = patches.view(B, mid, k * k, N).permute(0, 1, 3, 2)
+        patches = F.unfold(x_pad, kernel_size=k, stride=self.stride)  # [B, mid*k*k, N]
+        N = patches.shape[-1]  # H*W
+        patches = patches.view(B, mid, k*k, N).permute(0, 1, 3, 2)  # [B, mid, N, k*k]
 
-        # 恢复成图像形式 [B*N, mid, k, k]
-        patches_img = patches.permute(0, 2, 1, 3).reshape(B*N, mid, k, k)
-        assert not torch.isnan(patches_img).any(), "NaN in patches_img"
-        # 构建仿射变换，旋转 patch
-        angle_flat = angle.reshape(-1)
-        cos_t = torch.cos(angle_flat)
-        sin_t = torch.sin(angle_flat)
-        center = (k - 1) / 2.0
-        theta_affine = torch.zeros(B * N, 2, 3, device=device)
-        theta_affine[:, 0, 0] = cos_t
-        theta_affine[:, 0, 1] = -sin_t
-        theta_affine[:, 0, 2] = center - cos_t * center + sin_t * center
-        theta_affine[:, 1, 0] = sin_t
-        theta_affine[:, 1, 1] = cos_t
-        theta_affine[:, 1, 2] = center - sin_t * center - cos_t * center
+        # 4. 对每个位置，旋转基础核，然后与 patch 做点积
+        # 展平空间位置
+        angle_flat = angle.reshape(-1)  # [B*N]
+        # 输出容器
+        out_low_flat = torch.zeros(B*N, mid, device=device)
 
-        grid = F.affine_grid(theta_affine, patches_img.size(), align_corners=False)
-        patches_rot = F.grid_sample(patches_img, grid, mode='bilinear',
-                                    padding_mode='zeros', align_corners=False)
-        assert not torch.isnan(patches_rot).any(), "NaN in patches_rot after grid_sample"
+        # 遍历每个位置（可优化，但先保证正确性）
+        for idx in range(B*N):
+            a = angle_flat[idx]
+            # 旋转基础核
+            rot_kernel = self._rotate_kernel(self.base_kernel, a)  # [mid, 1, k, k]
+            rot_kernel_flat = rot_kernel.view(mid, k*k)  # [mid, k*k]
+            # 取对应 patch
+            patch = patches.view(B*N, mid, k*k)[idx]  # [mid, k*k]
+            # 逐通道点积
+            out_val = (patch * rot_kernel_flat).sum(dim=1)  # [mid]
+            out_low_flat[idx] = out_val
 
-        # 深度卷积
-        out_conv = F.conv2d(patches_rot, self.fixed_kernel, groups=mid)
-        assert not torch.isnan(out_conv).any(), "NaN in out_conv after depthwise conv"
-
-        out_conv = out_conv.view(B, N, mid).permute(0, 2, 1)
-        out_low = out_conv.view(B, mid, H, W)
+        out_low = out_low_flat.view(B, mid, H, W)
         out = self.expand(out_low)
-        assert not torch.isnan(out).any(), "NaN in final out after expand"
-
         return out
 
 
