@@ -94,12 +94,10 @@ class DynamicDirectionalConv(nn.Module):
         patches = F.unfold(x_pad, kernel_size=k, stride=self.stride)
         N = patches.shape[-1]
         patches = patches.view(B, mid, k * k, N).permute(0, 1, 3, 2)
-        patches_img = patches.permute(0, 2, 1, 3).reshape(B * N, mid, k, k)
-        assert not torch.isnan(patches_img).any(), "NaN in patches_img"
 
         # 恢复成图像形式 [B*N, mid, k, k]
         patches_img = patches.permute(0, 2, 1, 3).reshape(B*N, mid, k, k)
-
+        assert not torch.isnan(patches_img).any(), "NaN in patches_img"
         # 构建仿射变换，旋转 patch
         angle_flat = angle.reshape(-1)
         cos_t = torch.cos(angle_flat)
