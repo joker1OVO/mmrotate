@@ -19,10 +19,16 @@ model = dict(
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
-        type='mrf',
-        in_channels=[256, 512, 1024, 2048],  # 对应 C2~C5
+        type='AngleFreqEnhanceFPN',
+        in_channels=[256, 512, 1024, 2048],
         out_channels=256,
-        num_outs=5
+        num_outs=5,
+        fusion_modes=['add', 'afe', 'afe'],
+        afe_mid_channels=16,  # 可调整，例如 8, 16, 32
+        afe_kernel_size=7,  # 可调整，例如 5, 7, 9
+        start_level=0,
+        add_extra_convs='on_output',
+        relu_before_extra_convs=True
     ),
     rpn_head=dict(
         type='OrientedRPNHead',
