@@ -76,12 +76,13 @@ class DynamicDirectionalConv(nn.Module):
         )
 
     def forward(self, x):
+        assert not torch.isnan(x).any(), "NaN in input x"
         B, C, H, W = x.shape
         device = x.device
         k = self.kernel_size
         pad = self.padding
         mid = self.mid_channels
-
+        assert not torch.isnan(self.reduce.weight).any(), "NaN in reduce.weight"
         x_low = self.reduce(x)   # [B, mid, H, W]
         assert not torch.isnan(x_low).any(), "NaN in x_low after reduce"
         # 计算角度图（在低维特征上）
