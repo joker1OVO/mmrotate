@@ -142,7 +142,8 @@ class DynamicDirectionalConv(nn.Module):
             rot_kernel = self._rotate_kernel(self.base_kernel, a)  # [mid, 1, k, k]
             rot_kernel_flat = rot_kernel.view(mid, k*k)  # [mid, k*k]
             # 取对应 patch
-            patch = patches.view(B*N, mid, k*k)[idx]  # [mid, k*k]
+            patches_flat = patches.reshape(B * N, mid, k * k)  # 先 reshape 成 [B*N, mid, k*k]
+            patch = patches_flat[idx]  # 取第 idx 个
             # 逐通道点积
             out_val = (patch * rot_kernel_flat).sum(dim=1)  # [mid]
             out_low_flat[idx] = out_val
