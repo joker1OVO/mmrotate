@@ -17,12 +17,15 @@ model = dict(
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
-        type='EFC_FPN',
-        in_channels=[256, 512, 1024, 2048],  # 根据你的 backbone 实际输出调整
-        out_channels=256,
+        type='AngleFreqEnhanceFPN',
+        in_channels=[256, 512, 1024, 2048],  # ResNet50 输出
+        out_channels=256,  # 必须能被 4 整除
         num_outs=5,
-        start_level=0,  # 通常从 C3 开始（索引1），C2 分辨率太高可不参与
-        group_num=16
+        fusion_modes=['add', 'afe', 'afe'],  # 根据需要修改
+        afe_kernel_size=7,
+        start_level=0,
+        add_extra_convs='on_output',
+        relu_before_extra_convs=True
     ),
     rpn_head=dict(
         type='OrientedRPNHead',
