@@ -107,50 +107,85 @@ class DynamicDirectionalConv(nn.Module):
         return rotated  # [mid, 1, k, k]
 
     def forward(self, x):
+        import time
         B, C, H, W = x.shape
         device = x.device
         k = self.kernel_size
         pad = self.padding
         mid = self.mid_channels
+        num_angles = self.num_angles
 
+        torch.cuda.synchronize()
+        t0 = time.time()
+        mem0 = torch.cuda.memory_allocated() / 1e6 if device.type == 'cuda' else 0
+        print(f"[AFE] start forward | shape {x.shape} | mem {mem0:.1f}MB")
+
+        # 1. 降维
         x_low = self.reduce(x)
+        torch.cuda.synchronize()
+        t1 = time.time()
+        mem1 = torch.cuda.memory_allocated() / 1e6 if device.type == 'cuda' else 0
+        print(f"[AFE] after reduce | {t1 - t0:.2f}s | mem {mem1:.1f}MB")
 
+        # 2. 计算角度图
         angle_fft = compute_angle_map(x_low, window_size=k, stride=self.stride)
         angle = angle_fft + self.angle_bias
         angle = angle % math.pi
         angle = torch.clamp(angle, 0, math.pi - 1e-6)
+        torch.cuda.synchronize()
+        t2 = time.time()
+        mem2 = torch.cuda.memory_allocated() / 1e6 if device.type == 'cuda' else 0
+        print(f"[AFE] after angle_map | {t2 - t1:.2f}s | mem {mem2:.1f}MB")
 
-        # 获取 patches
+        # 3. 预旋转核（离散角度）
+        pre_rotated = []
+        for i in range(num_angles):
+            theta_i = self.angle_grid[i]
+            rot_kernel = self._rotate_kernel(self.base_kernel, theta_i)  # [mid,1,k,k]
+            pre_rotated.append(rot_kernel.view(mid, k * k))
+        pre_rotated = torch.stack(pre_rotated, dim=0)  # [num_angles, mid, k*k]
+        torch.cuda.synchronize()
+        t3 = time.time()
+        mem3 = torch.cuda.memory_allocated() / 1e6 if device.type == 'cuda' else 0
+        print(f"[AFE] after pre-rotate {num_angles} kernels | {t3 - t2:.2f}s | mem {mem3:.1f}MB")
+
+        # 4. 获取 patches
         x_pad = F.pad(x_low, (pad, pad, pad, pad), mode='reflect')
         patches = F.unfold(x_pad, kernel_size=k, stride=self.stride)  # [B, mid*k*k, N]
-        N = patches.shape[-1]
+        N = patches.shape[-1]  # H_out * W_out
         patches = patches.view(B, mid, k * k, N).permute(0, 1, 3, 2)  # [B, mid, N, k*k]
         patches_flat = patches.permute(0, 2, 1, 3).reshape(B * N, mid, k * k)  # [B*N, mid, k*k]
+        torch.cuda.synchronize()
+        t4 = time.time()
+        mem4 = torch.cuda.memory_allocated() / 1e6 if device.type == 'cuda' else 0
+        print(f"[AFE] after unfold | {t4 - t3:.2f}s | N={N} | mem {mem4:.1f}MB")
 
+        # 5. 量化角度
         angle_flat = angle.reshape(-1)  # [B*N]
+        indices = torch.argmin(torch.abs(angle_flat.unsqueeze(1) - self.angle_grid.unsqueeze(0)), dim=1)  # [B*N]
+        torch.cuda.synchronize()
+        t5 = time.time()
+        print(f"[AFE] after angle quantization | {t5 - t4:.2f}s")
 
-        # 1. 收集唯一角度
-        unique_angles = torch.unique(angle_flat)  # 去重，返回排序后的1D张量
-        # 2. 为每个唯一角度生成旋转核 (字典)
-        kernel_cache = {}
-        for theta in unique_angles:
-            # 注意：theta 是0维标量张量，需要取出数值作为标量
-            # 但 _rotate_kernel 期望标量 Tensor，可直接传入
-            rot_k = self._rotate_kernel(self.base_kernel, theta)  # [mid,1,k,k]
-            kernel_cache[theta.item()] = rot_k.view(mid, k * k)  # 储存在CPU或device
-
-        # 3. 逐位置计算
+        # 6. 逐位置点积
         out_low_flat = torch.zeros(B * N, mid, device=device)
         for idx in range(B * N):
-            a = angle_flat[idx]
-            # 从缓存中取出旋转核（字典查找）
-            rot_kernel_flat = kernel_cache[a.item()]
-            patch = patches_flat[idx]
-            out_val = (patch * rot_kernel_flat).sum(dim=1)
+            rot_kernel_flat = pre_rotated[indices[idx]]  # [mid, k*k]
+            patch = patches_flat[idx]  # [mid, k*k]
+            out_val = (patch * rot_kernel_flat).sum(dim=1)  # [mid]
             out_low_flat[idx] = out_val
+        torch.cuda.synchronize()
+        t6 = time.time()
+        mem6 = torch.cuda.memory_allocated() / 1e6 if device.type == 'cuda' else 0
+        print(f"[AFE] after loop over {B * N} positions | {t6 - t5:.2f}s | mem {mem6:.1f}MB")
 
         out_low = out_low_flat.view(B, mid, H, W)
         out = self.expand(out_low)
+        torch.cuda.synchronize()
+        t7 = time.time()
+        mem7 = torch.cuda.memory_allocated() / 1e6 if device.type == 'cuda' else 0
+        print(f"[AFE] after expand | {t7 - t6:.2f}s | mem {mem7:.1f}MB")
+        print(f"[AFE] total forward time: {t7 - t0:.2f}s")
         return out
 
 
