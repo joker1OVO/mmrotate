@@ -9,6 +9,7 @@ from typing import List
 
 EPS = 1e-8
 
+
 def estimate_main_direction_batch(patch_tensor, eps=EPS):
     """
     patch_tensor: [B*N, 1, m, m]
@@ -41,7 +42,12 @@ def estimate_main_direction_batch(patch_tensor, eps=EPS):
     theta_e = theta_valid[max_idx]
     return theta_e % math.pi
 
+
 def compute_angle_map(x, window_size=7, stride=1):
+    """
+    x: [B, C, H, W]
+    Returns: [B, H, W] angle in radians [0, pi)
+    """
     B, C, H, W = x.shape
     x_mean = x.mean(dim=1, keepdim=True)
     pad = window_size // 2
@@ -54,12 +60,16 @@ def compute_angle_map(x, window_size=7, stride=1):
     angle_map = torch.nan_to_num(angle_map, nan=0.0, posinf=math.pi, neginf=0.0)
     return angle_map
 
-class DynamicDirectionalConv(nn.Module):
-    def __init__(self, in_channels, mid_channels=16, kernel_size=7, stride=1, padding=None,
-                 num_angles=60):   # 改为 60
+
+class AngleAdaptiveConv(nn.Module):
+    """
+    角度自适应深度卷积（旋转卷积核版本）
+    输入输出通道相同（默认 64），使用预旋转 60 个离散角度 + 向量化点积。
+    内部计算角度时额外加上 90°（π/2），使卷积核长轴对齐目标长轴。
+    """
+    def __init__(self, in_channels, kernel_size=7, stride=1, padding=None, num_angles=60):
         super().__init__()
         self.in_channels = in_channels
-        self.mid_channels = mid_channels
         self.kernel_size = kernel_size
         self.stride = stride
         if padding is None:
@@ -67,14 +77,12 @@ class DynamicDirectionalConv(nn.Module):
         self.padding = padding
         self.num_angles = num_angles
 
-        self.reduce = nn.Conv2d(in_channels, mid_channels, 1, bias=False)
-        self.expand = nn.Conv2d(mid_channels, in_channels, 1, bias=False)
-        self.angle_bias = nn.Parameter(torch.tensor(0.0))
-
-        # 可学习的基础卷积核（高斯初始化）
+        # 可学习的基础卷积核（深度卷积形式，每个通道独立）
         self.base_kernel = nn.Parameter(
-            self._create_gaussian_kernel(kernel_size, sigma=0.5).repeat(mid_channels, 1, 1, 1)
+            self._create_gaussian_kernel(kernel_size, sigma=0.5).repeat(in_channels, 1, 1, 1)
         )
+        # 可学习的角度残差（初始 0）
+        self.angle_bias = nn.Parameter(torch.tensor(0.0))
 
         # 预定义离散角度（弧度），范围 [0, π)
         self.register_buffer('angle_grid', torch.linspace(0, math.pi, num_angles, dtype=torch.float32))
@@ -87,8 +95,8 @@ class DynamicDirectionalConv(nn.Module):
         return kernel.unsqueeze(0).unsqueeze(0)  # [1,1,k,k]
 
     def _rotate_kernel(self, kernel, angle):
-        """旋转基础核，kernel: [mid,1,k,k], angle: scalar Tensor"""
-        mid, _, k, _ = kernel.shape
+        """旋转基础核，kernel: [C,1,k,k], angle: scalar Tensor"""
+        C, _, k, _ = kernel.shape
         device = kernel.device
         center = (k - 1) / 2.0
         cos_a = torch.cos(angle)
@@ -97,68 +105,121 @@ class DynamicDirectionalConv(nn.Module):
             [cos_a, -sin_a, center - cos_a*center + sin_a*center],
             [sin_a,  cos_a, center - sin_a*center - cos_a*center]
         ], device=device).unsqueeze(0)  # [1,2,3]
-        kernel_4d = kernel.view(mid, 1, k, k)
-        grid = F.affine_grid(theta.expand(mid, -1, -1), kernel_4d.size(), align_corners=False)
+        kernel_4d = kernel.view(C, 1, k, k)
+        grid = F.affine_grid(theta.expand(C, -1, -1), kernel_4d.size(), align_corners=False)
         rotated = F.grid_sample(kernel_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
-        return rotated  # [mid,1,k,k]
+        return rotated  # [C,1,k,k]
 
     def forward(self, x):
         B, C, H, W = x.shape
-        device = x.device
+        assert C == self.in_channels
         k = self.kernel_size
         pad = self.padding
-        mid = self.mid_channels
-        num_angles = self.num_angles
 
-        # 1. 降维
-        x_low = self.reduce(x)  # [B, mid, H, W]
-
-        # 2. 角度图
-        angle_fft = compute_angle_map(x_low, window_size=k, stride=self.stride)
-        angle = angle_fft + self.angle_bias
-        angle = angle % math.pi
+        # 1. 计算角度（FFT主轴方向 + 可学习残差 + 固定偏移 π/2）
+        angle_fft = compute_angle_map(x, window_size=k, stride=self.stride)   # [B, H, W]
+        # 注：compute_angle_map 内部已经对输入做了通道均值，所以这里输入 x 可以是任意通道数
+        angle = angle_fft + self.angle_bias + math.pi / 2   # 加 90°
+        angle = angle % math.pi            # 限制到 [0, π)
         angle = torch.clamp(angle, 0, math.pi - 1e-6)
 
-        # 3. 预旋转所有离散角度的核（向量化）
+        # 2. 预旋转所有离散角度的核
         pre_rotated = []
-        for i in range(num_angles):
+        for i in range(self.num_angles):
             theta_i = self.angle_grid[i]
-            rot_kernel = self._rotate_kernel(self.base_kernel, theta_i)  # [mid,1,k,k]
-            pre_rotated.append(rot_kernel.view(mid, k*k))
-        pre_rotated = torch.stack(pre_rotated, dim=0)  # [num_angles, mid, k*k]
+            rot_kernel = self._rotate_kernel(self.base_kernel, theta_i)   # [C,1,k,k]
+            pre_rotated.append(rot_kernel.view(C, k*k))
+        pre_rotated = torch.stack(pre_rotated, dim=0)   # [num_angles, C, k*k]
 
-        # 4. 获取 patches 并展平
-        x_pad = F.pad(x_low, (pad, pad, pad, pad), mode='reflect')
-        patches = F.unfold(x_pad, kernel_size=k, stride=self.stride)  # [B, mid*k*k, N]
-        N = patches.shape[-1]  # H_out * W_out
-        patches = patches.view(B, mid, k*k, N).permute(0, 1, 3, 2)   # [B, mid, N, k*k]
-        patches_flat = patches.permute(0, 2, 1, 3).reshape(B*N, mid, k*k)  # [B*N, mid, k*k]
+        # 3. 获取 patches 并展平
+        x_pad = F.pad(x, (pad, pad, pad, pad), mode='reflect')
+        patches = F.unfold(x_pad, kernel_size=k, stride=self.stride)   # [B, C*k*k, N]
+        N = patches.shape[-1]   # H_out * W_out
+        patches = patches.view(B, C, k*k, N).permute(0, 1, 3, 2)        # [B, C, N, k*k]
+        patches_flat = patches.permute(0, 2, 1, 3).reshape(B*N, C, k*k) # [B*N, C, k*k]
 
-        # 5. 量化角度 -> 最近索引
-        angle_flat = angle.reshape(-1)  # [B*N]
+        # 4. 量化角度
+        angle_flat = angle.reshape(-1)   # [B*N]
         indices = torch.argmin(torch.abs(angle_flat.unsqueeze(1) - self.angle_grid.unsqueeze(0)), dim=1)  # [B*N]
 
-        # 6. 向量化深度卷积（一次完成所有位置）
-        selected_kernels = pre_rotated[indices]          # [B*N, mid, k*k]
-        out_low_flat = (patches_flat * selected_kernels).sum(dim=2)  # [B*N, mid]
+        # 5. 向量化深度卷积
+        selected_kernels = pre_rotated[indices]          # [B*N, C, k*k]
+        out_flat = (patches_flat * selected_kernels).sum(dim=2)   # [B*N, C]
 
-        out_low = out_low_flat.view(B, mid, H, W)
-        out = self.expand(out_low)
+        out = out_flat.view(B, C, H, W)
+        return out
+
+
+class MultiBranchAFE(nn.Module):
+    """
+    四分支多尺度方向增强模块：
+      - 分支1：恒等映射
+      - 分支2：1x7 深度可分离卷积（水平）
+      - 分支3：7x1 深度可分离卷积（垂直）
+      - 分支4：角度自适应卷积（旋转核 + 90° 偏移）
+    输入通道假设为 256，被均分为 4 份（每份 64）。
+    """
+    def __init__(self, in_channels=256, kernel_size=7, stride=1, padding=None):
+        super().__init__()
+        assert in_channels % 4 == 0, "in_channels must be divisible by 4"
+        self.in_channels = in_channels
+        self.branch_channels = in_channels // 4   # 64
+        self.kernel_size = kernel_size
+        self.stride = stride
+        if padding is None:
+            padding = kernel_size // 2
+        self.padding = padding
+
+        # 分支2: 1x7 深度可分离卷积
+        self.dw_horiz = nn.Conv2d(self.branch_channels, self.branch_channels,
+                                  kernel_size=(1, kernel_size), stride=stride,
+                                  padding=(0, padding), groups=self.branch_channels, bias=False)
+        # 分支3: 7x1 深度可分离卷积
+        self.dw_vert = nn.Conv2d(self.branch_channels, self.branch_channels,
+                                 kernel_size=(kernel_size, 1), stride=stride,
+                                 padding=(padding, 0), groups=self.branch_channels, bias=False)
+        # 分支4: 角度自适应卷积
+        self.angle_conv = AngleAdaptiveConv(self.branch_channels, kernel_size=kernel_size,
+                                            stride=stride, padding=padding)
+
+        # 融合卷积（1x1）
+        self.fusion = nn.Conv2d(in_channels, in_channels, 1, bias=False)
+        self.bn_fusion = nn.BatchNorm2d(in_channels)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        # 按通道分割
+        ch = self.branch_channels
+        x1 = x[:, :ch, :, :]          # 恒等
+        x2 = x[:, ch:2*ch, :, :]      # 水平
+        x3 = x[:, 2*ch:3*ch, :, :]    # 垂直
+        x4 = x[:, 3*ch:4*ch, :, :]    # 角度自适应
+
+        # 处理各分支
+        out1 = x1
+        out2 = self.dw_horiz(x2)
+        out3 = self.dw_vert(x3)
+        out4 = self.angle_conv(x4)
+
+        out = torch.cat([out1, out2, out3, out4], dim=1)
+        out = self.fusion(out)
+        out = self.bn_fusion(out)
+        out = self.act(out)
         return out
 
 
 @ROTATED_NECKS.register_module()
 class AngleFreqEnhanceFPN(FPN):
     """
-    增强版 FPN，支持可配置的 AFE 模块参数
+    增强版 FPN，支持可配置的 AFE 模块参数。
+    当 fusion_mode 为 'afe' 时，使用 MultiBranchAFE 进行方向增强融合。
     """
     def __init__(self,
                  in_channels,
                  out_channels,
                  num_outs,
                  fusion_modes: List[str],
-                 afe_mid_channels=16,      # 新增：降维通道数
-                 afe_kernel_size=7,        # 新增：局部窗口大小 / 卷积核大小
+                 afe_kernel_size=7,        # 仅保留 kernel_size 参数
                  **kwargs):
         super().__init__(
             in_channels=in_channels,
@@ -170,10 +231,11 @@ class AngleFreqEnhanceFPN(FPN):
         self.dynamic_convs = nn.ModuleList()
         for mode in fusion_modes:
             if mode == 'afe':
+                # 注意：MultiBranchAFE 内部固定输入输出通道数为 out_channels（必须能被 4 整除）
+                assert out_channels % 4 == 0, "out_channels must be divisible by 4 for AFE"
                 self.dynamic_convs.append(
-                    DynamicDirectionalConv(
-                        out_channels,
-                        mid_channels=afe_mid_channels,
+                    MultiBranchAFE(
+                        in_channels=out_channels,
                         kernel_size=afe_kernel_size
                     )
                 )
