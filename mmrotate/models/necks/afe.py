@@ -55,7 +55,8 @@ def compute_angle_map(x, window_size=7, stride=1):
     return angle_map
 
 class DynamicDirectionalConv(nn.Module):
-    def __init__(self, in_channels, mid_channels=16, kernel_size=7, stride=1, padding=None):
+    def __init__(self, in_channels, mid_channels=16, kernel_size=7, stride=1, padding=None,
+                 num_angles=180):
         super().__init__()
         self.in_channels = in_channels
         self.mid_channels = mid_channels
@@ -64,16 +65,19 @@ class DynamicDirectionalConv(nn.Module):
         if padding is None:
             padding = kernel_size // 2
         self.padding = padding
+        self.num_angles = num_angles  # 离散角度数量
 
         self.reduce = nn.Conv2d(in_channels, mid_channels, 1, bias=False)
         self.expand = nn.Conv2d(mid_channels, in_channels, 1, bias=False)
         self.angle_bias = nn.Parameter(torch.tensor(0.0))
 
         # 可学习的基础卷积核（深度卷积形式）
-        # 初始化：高斯平滑核，有助于稳定性
         self.base_kernel = nn.Parameter(
             self._create_gaussian_kernel(kernel_size, sigma=0.5).repeat(mid_channels, 1, 1, 1)
         )
+
+        # 预定义离散角度（弧度），范围 [0, π)
+        self.register_buffer('angle_grid', torch.linspace(0, math.pi, num_angles, dtype=torch.float32))
 
     def _create_gaussian_kernel(self, k, sigma):
         ax = torch.linspace(-(k//2), k//2, k)
@@ -93,15 +97,11 @@ class DynamicDirectionalConv(nn.Module):
         center = (k - 1) / 2.0
         cos_a = torch.cos(angle)
         sin_a = torch.sin(angle)
-        # 仿射矩阵（逆时针旋转）
         theta = torch.tensor([
             [cos_a, -sin_a, center - cos_a*center + sin_a*center],
             [sin_a,  cos_a, center - sin_a*center - cos_a*center]
         ], device=device).unsqueeze(0)  # [1,2,3]
-        # kernel 形状 [mid, 1, k, k] -> 扩展 batch 维 [mid, 1, k, k] 需要 unsqueeze(0) 变成 [1, mid, 1, k, k]
-        # 但 grid_sample 要求输入 [N, C, H, W]，这里 N=mid, C=1, H=W=k
-        # 所以将 mid 视为 batch 维度
-        kernel_4d = kernel.view(mid, 1, k, k)  # [mid, 1, k, k]
+        kernel_4d = kernel.view(mid, 1, k, k)
         grid = F.affine_grid(theta.expand(mid, -1, -1), kernel_4d.size(), align_corners=False)
         rotated = F.grid_sample(kernel_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
         return rotated  # [mid, 1, k, k]
@@ -112,39 +112,43 @@ class DynamicDirectionalConv(nn.Module):
         k = self.kernel_size
         pad = self.padding
         mid = self.mid_channels
+        num_angles = self.num_angles
 
         # 1. 降维
         x_low = self.reduce(x)  # [B, mid, H, W]
 
-        # 2. 计算角度图（借用原有方法，它是在低维特征上计算）
+        # 2. 计算角度图
         angle_fft = compute_angle_map(x_low, window_size=k, stride=self.stride)
         angle = angle_fft + self.angle_bias
         angle = angle % math.pi
-        # 限制角度范围，避免过大偏移
         angle = torch.clamp(angle, 0, math.pi - 1e-6)
 
-        # 3. 获取 patches
+        # 3. 预生成所有离散角度的旋转核（基于当前 base_kernel）
+        # 注意：这里每次 forward 都会重新计算 180 次旋转，但比每个位置旋转一次要快得多
+        pre_rotated = []
+        for i in range(num_angles):
+            theta_i = self.angle_grid[i]
+            rot_kernel = self._rotate_kernel(self.base_kernel, theta_i)  # [mid,1,k,k]
+            pre_rotated.append(rot_kernel.view(mid, k*k))  # 展平为 [mid, k*k]
+        pre_rotated = torch.stack(pre_rotated, dim=0)  # [num_angles, mid, k*k]
+
+        # 4. 获取 patches 并展平
         x_pad = F.pad(x_low, (pad, pad, pad, pad), mode='reflect')
         patches = F.unfold(x_pad, kernel_size=k, stride=self.stride)  # [B, mid*k*k, N]
         N = patches.shape[-1]  # H*W
         patches = patches.view(B, mid, k*k, N).permute(0, 1, 3, 2)  # [B, mid, N, k*k]
+        patches_flat = patches.permute(0, 2, 1, 3).reshape(B*N, mid, k*k)  # [B*N, mid, k*k]
 
-        # 4. 对每个位置，旋转基础核，然后与 patch 做点积
-        # 展平空间位置
+        # 5. 量化角度到最近索引
         angle_flat = angle.reshape(-1)  # [B*N]
-        # 输出容器
-        out_low_flat = torch.zeros(B*N, mid, device=device)
+        # 找到每个角度在 angle_grid 中的最近索引
+        indices = torch.argmin(torch.abs(angle_flat.unsqueeze(1) - self.angle_grid.unsqueeze(0)), dim=1)  # [B*N]
 
-        # 遍历每个位置（可优化，但先保证正确性）
+        # 6. 逐位置计算：根据索引取出预旋转核，与 patch 点积
+        out_low_flat = torch.zeros(B*N, mid, device=device)
         for idx in range(B*N):
-            a = angle_flat[idx]
-            # 旋转基础核
-            rot_kernel = self._rotate_kernel(self.base_kernel, a)  # [mid, 1, k, k]
-            rot_kernel_flat = rot_kernel.view(mid, k*k)  # [mid, k*k]
-            # 取对应 patch
-            patches_flat = patches.reshape(B * N, mid, k * k)  # 先 reshape 成 [B*N, mid, k*k]
-            patch = patches_flat[idx]  # 取第 idx 个
-            # 逐通道点积
+            rot_kernel_flat = pre_rotated[indices[idx]]  # [mid, k*k]
+            patch = patches_flat[idx]                    # [mid, k*k]
             out_val = (patch * rot_kernel_flat).sum(dim=1)  # [mid]
             out_low_flat[idx] = out_val
 
