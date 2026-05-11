@@ -20,10 +20,10 @@ model = dict(
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
         type='AngleFreqEnhanceFPN',
-        in_channels=[256, 512, 1024, 2048],  # ResNet50 输出
-        out_channels=256,  # 必须能被 4 整除
+        in_channels=[256, 512, 1024, 2048],
+        out_channels=256,  # 必须能被8整除
         num_outs=5,
-        fusion_modes=['afe', 'afe', 'afe'],  # 根据需要修改
+        fusion_modes=['add', 'afe', 'afe'],  # 需要多少层用多少个
         afe_kernel_size=7,
         start_level=0,
         add_extra_convs='on_output',
