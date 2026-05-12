@@ -54,9 +54,8 @@ def compute_angle_map(x, window_size=7, stride=1):
     return angle_map
 
 
-# ========== 旋转自适应卷积模块（简化版，预旋转60角度）==========
+# ========== 旋转自适应卷积模块（预旋转60角度）==========
 class AngleAdaptiveConv(nn.Module):
-    """旋转卷积核，基于FFT角度+可学习偏置+90°偏移，预旋转60个离散角度，向量化计算"""
     def __init__(self, in_channels, kernel_size=7, stride=1, padding=None, num_angles=60):
         super().__init__()
         self.in_channels = in_channels
@@ -101,39 +100,33 @@ class AngleAdaptiveConv(nn.Module):
         k = self.kernel_size
         pad = self.padding
 
-        # 计算角度（FFT主方向 + 可学习偏置 + 90°偏移）
         angle_fft = compute_angle_map(x, window_size=k, stride=self.stride)
         angle = angle_fft + self.angle_bias + math.pi / 2
         angle = angle % math.pi
         angle = torch.clamp(angle, 0, math.pi - 1e-6)
 
-        # 预旋转所有离散角度的核
         pre_rotated = []
         for i in range(self.num_angles):
             theta_i = self.angle_grid[i]
-            rot_k = self._rotate_kernel(self.base_kernel, theta_i)  # [C,1,k,k]
+            rot_k = self._rotate_kernel(self.base_kernel, theta_i)
             pre_rotated.append(rot_k.view(C, k*k))
-        pre_rotated = torch.stack(pre_rotated, dim=0)   # [num_angles, C, k*k]
+        pre_rotated = torch.stack(pre_rotated, dim=0)
 
-        # 提取 patches
         x_pad = F.pad(x, (pad, pad, pad, pad), mode='reflect')
-        patches = F.unfold(x_pad, kernel_size=k, stride=self.stride)  # [B, C*k*k, N]
+        patches = F.unfold(x_pad, kernel_size=k, stride=self.stride)
         N = patches.shape[-1]
-        patches = patches.view(B, C, k*k, N).permute(0, 1, 3, 2)       # [B, C, N, k*k]
-        patches_flat = patches.permute(0, 2, 1, 3).reshape(B*N, C, k*k) # [B*N, C, k*k]
+        patches = patches.view(B, C, k*k, N).permute(0, 1, 3, 2)
+        patches_flat = patches.permute(0, 2, 1, 3).reshape(B*N, C, k*k)
 
-        # 量化角度
-        angle_flat = angle.reshape(-1)  # [B*N]
-        indices = torch.argmin(torch.abs(angle_flat.unsqueeze(1) - self.angle_grid.unsqueeze(0)), dim=1)  # [B*N]
-
-        # 批量卷积（向量化点积）
-        selected_kernels = pre_rotated[indices]   # [B*N, C, k*k]
-        out_flat = (patches_flat * selected_kernels).sum(dim=2)  # [B*N, C]
+        angle_flat = angle.reshape(-1)
+        indices = torch.argmin(torch.abs(angle_flat.unsqueeze(1) - self.angle_grid.unsqueeze(0)), dim=1)
+        selected_kernels = pre_rotated[indices]
+        out_flat = (patches_flat * selected_kernels).sum(dim=2)
         out = out_flat.view(B, C, H, W)
         return out
 
 
-# ========== 通道注意力（SE）==========
+# ========== 通道注意力 (SE) ==========
 class ChannelAttention(nn.Module):
     def __init__(self, channels, reduction=16):
         super().__init__()
@@ -146,52 +139,69 @@ class ChannelAttention(nn.Module):
         )
 
     def forward(self, x):
-        b, c, _, _ = x.size()
+        b, c, _, _ = x.shape
         y = self.avg_pool(x).view(b, c)
         y = self.fc(y).view(b, c, 1, 1)
         return x * y
 
 
-# ========== 四分支主模块 ==========
+# ========== 空间注意力 ==========
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        assert kernel_size % 2 == 1, "kernel_size must be odd"
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # x: [B, C, H, W]
+        avg_out = torch.mean(x, dim=1, keepdim=True)   # [B,1,H,W]
+        max_out, _ = torch.max(x, dim=1, keepdim=True)  # [B,1,H,W]
+        concat = torch.cat([avg_out, max_out], dim=1)   # [B,2,H,W]
+        attention = self.sigmoid(self.conv(concat))     # [B,1,H,W]
+        return x * attention
+
+
+# ========== 四分支主模块（带 GroupNorm 和 CBAM 风格注意力）==========
 class MultiBranchAFE(nn.Module):
-    """四分支多尺度方向增强模块（即插即用）"""
     def __init__(self,
                  in_channels,
-                 kernel_size_small=7,    # 方形卷积核尺寸
-                 kernel_size_asym1=7,    # 第一组非对称卷积核尺寸
-                 kernel_size_asym2=13,   # 第二组非对称卷积核尺寸
+                 kernel_size_small=7,
+                 kernel_size_asym1=7,
+                 kernel_size_asym2=13,
                  stride=1,
                  padding=None,
-                 reduction=16):
+                 reduction=16,          # SE 压缩比
+                 spatial_kernel=7):     # 空间注意力卷积核大小
         super().__init__()
         assert in_channels % 4 == 0, "in_channels must be divisible by 4"
         self.in_channels = in_channels
         self.branch_channels = in_channels // 4
 
-        # 分支1: 7x7 深度可分离卷积
+        # 分支1: 7x7 depthwise conv
         self.conv_square = nn.Conv2d(self.branch_channels, self.branch_channels,
                                      kernel_size=kernel_size_small, stride=stride,
                                      padding=kernel_size_small//2 if padding is None else padding,
                                      groups=self.branch_channels, bias=False)
-        self.bn_square = nn.BatchNorm2d(self.branch_channels)
+        self.gn_square = nn.GroupNorm(num_groups=16, num_channels=self.branch_channels)
 
-        # 分支2: 1x7 + 7x1 串联 (非对称)
+        # 分支2: 1x7 + 7x1 (非对称)
         self.conv_asym1_h = nn.Conv2d(self.branch_channels, self.branch_channels,
                                       kernel_size=(1, kernel_size_asym1), stride=stride,
                                       padding=(0, kernel_size_asym1//2), groups=self.branch_channels, bias=False)
         self.conv_asym1_v = nn.Conv2d(self.branch_channels, self.branch_channels,
                                       kernel_size=(kernel_size_asym1, 1), stride=1,
                                       padding=(kernel_size_asym1//2, 0), groups=self.branch_channels, bias=False)
-        self.bn_asym1 = nn.BatchNorm2d(self.branch_channels)
+        self.gn_asym1 = nn.GroupNorm(num_groups=16, num_channels=self.branch_channels)
 
-        # 分支3: 1x13 + 13x1 串联 (更大感受野)
+        # 分支3: 1x13 + 13x1 (更大感受野)
         self.conv_asym2_h = nn.Conv2d(self.branch_channels, self.branch_channels,
                                       kernel_size=(1, kernel_size_asym2), stride=stride,
                                       padding=(0, kernel_size_asym2//2), groups=self.branch_channels, bias=False)
         self.conv_asym2_v = nn.Conv2d(self.branch_channels, self.branch_channels,
                                       kernel_size=(kernel_size_asym2, 1), stride=1,
                                       padding=(kernel_size_asym2//2, 0), groups=self.branch_channels, bias=False)
-        self.bn_asym2 = nn.BatchNorm2d(self.branch_channels)
+        self.gn_asym2 = nn.GroupNorm(num_groups=16, num_channels=self.branch_channels)
 
         # 分支4: 旋转自适应卷积
         self.rot_conv = AngleAdaptiveConv(self.branch_channels, kernel_size=kernel_size_small, stride=stride)
@@ -199,61 +209,61 @@ class MultiBranchAFE(nn.Module):
         # 激活函数
         self.act = nn.SiLU()
 
-        # 融合部分：通道注意力 + 1x1卷积
-        self.se = ChannelAttention(in_channels, reduction=reduction)
+        # 融合部分: 通道注意力 + 空间注意力 (CBAM风格) → 1x1卷积
+        self.channel_att = ChannelAttention(in_channels, reduction=reduction)
+        self.spatial_att = SpatialAttention(kernel_size=spatial_kernel)
         self.fusion_conv = nn.Conv2d(in_channels, in_channels, 1, bias=False)
-        self.bn_fusion = nn.BatchNorm2d(in_channels)
+        self.gn_fusion = nn.GroupNorm(num_groups=16, num_channels=in_channels)
 
     def forward(self, x):
         B, C, H, W = x.shape
         ch = self.branch_channels
 
-        # 按通道分割
-        x1 = x[:, :ch, :, :]          # 分支1输入
-        x2 = x[:, ch:2*ch, :, :]      # 分支2输入
-        x3 = x[:, 2*ch:3*ch, :, :]    # 分支3输入
-        x4 = x[:, 3*ch:4*ch, :, :]    # 分支4输入
+        # 分割
+        x1 = x[:, :ch, :, :]
+        x2 = x[:, ch:2*ch, :, :]
+        x3 = x[:, 2*ch:3*ch, :, :]
+        x4 = x[:, 3*ch:4*ch, :, :]
 
-        # 分支1: 7x7 depthwise conv
+        # 分支1
         out1 = self.conv_square(x1)
-        out1 = self.bn_square(out1)
+        out1 = self.gn_square(out1)
         out1 = self.act(out1)
 
-        # 分支2: 1x7 -> 7x1 (串联)
+        # 分支2
         out2 = self.conv_asym1_h(x2)
         out2 = self.conv_asym1_v(out2)
-        out2 = self.bn_asym1(out2)
+        out2 = self.gn_asym1(out2)
         out2 = self.act(out2)
 
-        # 分支3: 1x13 -> 13x1 (串联)
+        # 分支3
         out3 = self.conv_asym2_h(x3)
         out3 = self.conv_asym2_v(out3)
-        out3 = self.bn_asym2(out3)
+        out3 = self.gn_asym2(out3)
         out3 = self.act(out3)
 
-        # 分支4: 旋转自适应
-        out4 = self.rot_conv(x4)   # 内部已包含激活？原始没有，我们加一个激活
+        # 分支4
+        out4 = self.rot_conv(x4)
         out4 = self.act(out4)
 
         # 拼接
         out = torch.cat([out1, out2, out3, out4], dim=1)
 
-        # 融合 (通道注意力 + 1x1)
-        out = self.se(out)
-        out = self.fusion_conv(out)
-        out = self.bn_fusion(out)
+        # 融合: 通道注意力 → 空间注意力 → GroupNorm → 激活 → 1x1卷积
+        out = self.channel_att(out)
+        out = self.spatial_att(out)
+        out = self.gn_fusion(out)
         out = self.act(out)
+        out = self.fusion_conv(out)
 
         # 残差连接
         return out + x
 
 
-# ========== FPN 包装 ==========
 @ROTATED_NECKS.register_module()
 class AngleFreqEnhanceFPN(FPN):
     """
-    增强版 FPN，当 fusion_mode='afe' 时使用 MultiBranchAFE。
-    支持配置各分支的卷积核尺寸等参数。
+    增强版 FPN，使用 MultiBranchAFE 作为 'afe' 融合模式。
     """
     def __init__(self,
                  in_channels,
@@ -264,6 +274,7 @@ class AngleFreqEnhanceFPN(FPN):
                  afe_kernel_asym1=7,
                  afe_kernel_asym2=13,
                  afe_reduction=16,
+                 afe_spatial_kernel=7,
                  **kwargs):
         super().__init__(
             in_channels=in_channels,
@@ -275,14 +286,15 @@ class AngleFreqEnhanceFPN(FPN):
         self.dynamic_convs = nn.ModuleList()
         for mode in fusion_modes:
             if mode == 'afe':
-                assert out_channels % 4 == 0, "out_channels must be divisible by 4 for AFE"
+                assert out_channels % 4 == 0, "out_channels must be divisible by 4"
                 self.dynamic_convs.append(
                     MultiBranchAFE(
                         in_channels=out_channels,
                         kernel_size_small=afe_kernel_small,
                         kernel_size_asym1=afe_kernel_asym1,
                         kernel_size_asym2=afe_kernel_asym2,
-                        reduction=afe_reduction
+                        reduction=afe_reduction,
+                        spatial_kernel=afe_spatial_kernel
                     )
                 )
             else:
@@ -290,7 +302,6 @@ class AngleFreqEnhanceFPN(FPN):
 
     @auto_fp16()
     def forward(self, inputs):
-        # 同原始 FPN 的 lateral 构建
         laterals = [
             lateral_conv(inputs[i + self.start_level])
             for i, lateral_conv in enumerate(self.lateral_convs)
@@ -317,10 +328,8 @@ class AngleFreqEnhanceFPN(FPN):
             else:
                 raise ValueError(f"Unknown fusion mode: {mode}")
 
-        # 输出层（与原FPN相同）
         outs = [self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)]
 
-        # 生成额外层
         if self.num_outs > len(outs):
             if not self.add_extra_convs:
                 for i in range(self.num_outs - used_backbone_levels):
