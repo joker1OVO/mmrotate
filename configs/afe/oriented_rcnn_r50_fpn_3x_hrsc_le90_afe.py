@@ -21,8 +21,8 @@ model = dict(
         ),
     neck=dict(
         type='noFpn',
-        in_channels=[256, 512, 1024, 2048],  # ResNet50 输出
-        out_channels=256,  # 必须能被 4 整除
+        in_channels=[256, 512, 1024, 2048],  # ResNet50 四个输出
+        out_channels=256,
     ),
     rpn_head=dict(
         type='OrientedRPNHead',

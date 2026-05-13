@@ -4,7 +4,7 @@ from ..builder import ROTATED_NECKS
 
 @ROTATED_NECKS.register_module()
 class noFpn(nn.Module):
-    """仅统一通道数，不进行任何融合的多尺度neck。
+    """仅统一通道数并生成第5层，不进行任何融合的多尺度neck。
 
     Args:
         in_channels (list[int]): 骨干各层输出通道数，如 [256,512,1024,2048]
@@ -22,7 +22,7 @@ class noFpn(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.num_ins = len(in_channels)
+        self.num_ins = len(in_channels)   # 应该是4
 
         # 为每个输入层创建一个1x1卷积，将通道数统一到out_channels
         self.lateral_convs = nn.ModuleList()
@@ -37,11 +37,28 @@ class noFpn(nn.Module):
                 inplace=False)
             self.lateral_convs.append(l_conv)
 
+        # 用于生成第5层（P6）的卷积，步长为2的3x3卷积
+        self.extra_convs = ConvModule(
+            out_channels,
+            out_channels,
+            3,
+            stride=2,
+            padding=1,
+            conv_cfg=conv_cfg,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg,
+            inplace=False)
+
     def forward(self, inputs):
-        """前向传播，返回统一通道后的多尺度特征列表（顺序保持不变）。"""
-        assert len(inputs) == self.num_ins
+        """前向传播，返回统一通道后的多尺度特征列表，顺序从高分辨率到低分辨率，共5层。"""
+        assert len(inputs) == self.num_ins   # inputs 长度应为4
         outs = []
         for i, x in enumerate(inputs):
             out = self.lateral_convs[i](x)
             outs.append(out)
+
+        # 生成第5层（P6）：对最后一层（stride最大）进行步长为2的卷积下采样
+        p6 = self.extra_convs(outs[-1])
+        outs.append(p6)
+
         return tuple(outs)
