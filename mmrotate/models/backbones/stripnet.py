@@ -11,6 +11,7 @@ from functools import partial
 import warnings
 from mmcv.cnn import build_norm_layer
 
+
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -31,31 +32,32 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
+
 class StripBlock(nn.Module):
     def __init__(self, dim, k1, k2):
         super().__init__()
         self.conv0 = nn.Conv2d(dim, dim, 5, padding=2, groups=dim)
-        self.strip_conv1 = nn.Conv2d(dim,dim,kernel_size=(k1, k2), stride=1, padding=(k1//2, k2//2), groups=dim)     
-        self.strip_conv2 = nn.Conv2d(dim,dim,kernel_size=(k2, k1), stride=1, padding=(k2//2, k1//2), groups=dim)
+        self.conv_spatial1 = nn.Conv2d(dim, dim, kernel_size=(k1, k2), stride=1, padding=(k1 // 2, k2 // 2), groups=dim)
+        self.conv_spatial2 = nn.Conv2d(dim, dim, kernel_size=(k2, k1), stride=1, padding=(k2 // 2, k1 // 2), groups=dim)
 
         self.conv1 = nn.Conv2d(dim, dim, 1)
 
-    def forward(self, x):   
+    def forward(self, x):
         attn = self.conv0(x)
-        attn = self.strip_conv1(attn)
-        attn = self.strip_conv2(attn)
+        attn = self.conv_spatial1(attn)
+        attn = self.conv_spatial2(attn)
         attn = self.conv1(attn)
 
         return x * attn
 
 
 class Attention(nn.Module):
-    def __init__(self, d_model,k1,k2):
+    def __init__(self, d_model, k1, k2):
         super().__init__()
 
         self.proj_1 = nn.Conv2d(d_model, d_model, 1)
         self.activation = nn.GELU()
-        self.spatial_gating_unit = StripBlock(d_model,k1,k2)
+        self.spatial_gating_unit = StripBlock(d_model, k1, k2)
         self.proj_2 = nn.Conv2d(d_model, d_model, 1)
 
     def forward(self, x):
@@ -69,7 +71,7 @@ class Attention(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim, mlp_ratio=4., k1=1, k2=19, drop=0.,drop_path=0., act_layer=nn.GELU, norm_cfg=None):
+    def __init__(self, dim, mlp_ratio=4., k1=1, k2=19, drop=0., drop_path=0., act_layer=nn.GELU, norm_cfg=None):
         super().__init__()
         if norm_cfg:
             self.norm1 = build_norm_layer(norm_cfg, dim)[1]
@@ -77,11 +79,11 @@ class Block(nn.Module):
         else:
             self.norm1 = nn.BatchNorm2d(dim)
             self.norm2 = nn.BatchNorm2d(dim)
-        self.attn = Attention(dim,k1,k2)
+        self.attn = Attention(dim, k1, k2)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-        layer_scale_init_value = 1e-2            
+        layer_scale_init_value = 1e-2
         self.layer_scale_1 = nn.Parameter(
             layer_scale_init_value * torch.ones((dim)), requires_grad=True)
         self.layer_scale_2 = nn.Parameter(
@@ -107,23 +109,24 @@ class OverlapPatchEmbed(nn.Module):
         else:
             self.norm = nn.BatchNorm2d(embed_dim)
 
-
     def forward(self, x):
         x = self.proj(x)
         _, _, H, W = x.shape
-        x = self.norm(x)        
+        x = self.norm(x)
         return x, H, W
+
 
 @ROTATED_BACKBONES.register_module()
 class StripNet(BaseModule):
     def __init__(self, img_size=224, in_chans=3, embed_dims=[64, 128, 256, 512],
-                mlp_ratios=[8, 8, 4, 4], k1s=[1,1,1,1],k2s=[19,19,19,19],drop_rate=0., drop_path_rate=0., norm_layer=partial(nn.LayerNorm, eps=1e-6),
-                 depths=[3, 4, 6, 3], num_stages=4, 
+                 mlp_ratios=[8, 8, 4, 4], k1s=[1, 1, 1, 1], k2s=[19, 19, 19, 19], drop_rate=0., drop_path_rate=0.,
+                 norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                 depths=[3, 4, 6, 3], num_stages=4,
                  pretrained=None,
                  init_cfg=None,
                  norm_cfg=None):
         super().__init__(init_cfg=init_cfg)
-        
+
         assert not (init_cfg and pretrained), \
             'init_cfg and pretrained cannot be set at the same time'
         if isinstance(pretrained, str):
@@ -146,7 +149,8 @@ class StripNet(BaseModule):
                                             embed_dim=embed_dims[i], norm_cfg=norm_cfg)
 
             block = nn.ModuleList([Block(
-                dim=embed_dims[i], mlp_ratio=mlp_ratios[i], k1=k1s[i],k2=k2s[i],drop=drop_rate, drop_path=dpr[cur + j],norm_cfg=norm_cfg)
+                dim=embed_dims[i], mlp_ratio=mlp_ratios[i], k1=k1s[i], k2=k2s[i], drop=drop_rate,
+                drop_path=dpr[cur + j], norm_cfg=norm_cfg)
                 for j in range(depths[i])])
             norm = norm_layer(embed_dims[i])
             cur += depths[i]
@@ -154,8 +158,6 @@ class StripNet(BaseModule):
             setattr(self, f"patch_embed{i + 1}", patch_embed)
             setattr(self, f"block{i + 1}", block)
             setattr(self, f"norm{i + 1}", norm)
-
-
 
     def init_weights(self):
         print('init cfg', self.init_cfg)
@@ -173,7 +175,7 @@ class StripNet(BaseModule):
                         m, mean=0, std=math.sqrt(2.0 / fan_out), bias=0)
         else:
             super(StripNet, self).init_weights()
-            
+
     def freeze_patch_emb(self):
         self.patch_embed1.requires_grad = False
 

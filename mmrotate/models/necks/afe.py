@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,219 +6,230 @@ from mmdet.models.necks.fpn import FPN
 from ..builder import ROTATED_NECKS
 from typing import List
 
-EPS = 1e-8
 
+class CoordAttention(nn.Module):
+    """Coordinate Attention for spatial localization enhancement.
 
-def estimate_main_direction_batch(patch_tensor, eps=EPS):
+    As described in the ARFN-MoE paper (Eq. 11-16):
+        Pool H/W → Concat → Conv(1×1) → Split → Conv(1×1) per branch
+        → Sigmoid → element-wise multiply
+
+    No BN, no bottleneck — strictly follows the paper.
+
+    Args:
+        channels (int): Input channels.
     """
-    patch_tensor: [B*N, 1, m, m]
-    Returns: [B*N] angles in [0, pi)
-    """
-    Bn, _, m, _ = patch_tensor.shape
-    device = patch_tensor.device
-    x_fft = torch.fft.fft2(patch_tensor.squeeze(1), norm='ortho')
-    x_fft_shifted = torch.fft.fftshift(x_fft, dim=(-2, -1))
-    mag = x_fft_shifted.abs() + eps
 
-    h_freq = torch.fft.fftfreq(m, d=1.0) * m
-    w_freq = torch.fft.fftfreq(m, d=1.0) * m
-    h_grid, w_grid = torch.meshgrid(h_freq, w_freq, indexing='ij')
-    h_grid = torch.fft.fftshift(h_grid).to(device)
-    w_grid = torch.fft.fftshift(w_grid).to(device)
-
-    rho = torch.sqrt(h_grid ** 2 + w_grid ** 2)
-    theta = torch.atan2(h_grid, w_grid)
-    theta = (theta + 2 * math.pi) % (2 * math.pi)
-
-    mask = rho > eps
-    rho_valid = rho[mask]
-    theta_valid = theta[mask]
-
-    mag_flat = mag.view(Bn, -1)
-    mag_valid = mag_flat[:, mask.view(-1)]
-    weighted_energy = mag_valid * rho_valid.unsqueeze(0)
-    max_idx = torch.argmax(weighted_energy, dim=1)
-    theta_e = theta_valid[max_idx]
-    return theta_e % math.pi
-
-
-def compute_angle_map(x, window_size=7, stride=1):
-    """
-    x: [B, C, H, W]
-    Returns: [B, H, W] angle in radians [0, pi)
-    """
-    B, C, H, W = x.shape
-    x_mean = x.mean(dim=1, keepdim=True)
-    pad = window_size // 2
-    x_pad = F.pad(x_mean, (pad, pad, pad, pad), mode='reflect')
-    patches = F.unfold(x_pad, kernel_size=window_size, stride=stride)
-    N = patches.shape[-1]
-    patches = patches.transpose(1, 2).reshape(B * N, 1, window_size, window_size)
-    angles = estimate_main_direction_batch(patches)
-    angle_map = angles.view(B, H, W)
-    angle_map = torch.nan_to_num(angle_map, nan=0.0, posinf=math.pi, neginf=0.0)
-    return angle_map
-
-
-class AngleAdaptiveConv(nn.Module):
-    """
-    角度自适应深度卷积（旋转卷积核版本）
-    输入输出通道相同（默认 64），使用预旋转 60 个离散角度 + 向量化点积。
-    内部计算角度时额外加上 90°（π/2），使卷积核长轴对齐目标长轴。
-    """
-    def __init__(self, in_channels, kernel_size=7, stride=1, padding=None, num_angles=60):
+    def __init__(self, channels):
         super().__init__()
-        self.in_channels = in_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-        if padding is None:
-            padding = kernel_size // 2
-        self.padding = padding
-        self.num_angles = num_angles
-
-        # 可学习的基础卷积核（深度卷积形式，每个通道独立）
-        self.base_kernel = nn.Parameter(
-            self._create_gaussian_kernel(kernel_size, sigma=0.5).repeat(in_channels, 1, 1, 1)
-        )
-        # 可学习的角度残差（初始 0）
-        self.angle_bias = nn.Parameter(torch.tensor(0.0))
-
-        # 预定义离散角度（弧度），范围 [0, π)
-        self.register_buffer('angle_grid', torch.linspace(0, math.pi, num_angles, dtype=torch.float32))
-
-    def _create_gaussian_kernel(self, k, sigma):
-        ax = torch.linspace(-(k//2), k//2, k)
-        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
-        kernel = torch.exp(-(xx**2 + yy**2) / (2*sigma**2))
-        kernel = kernel / kernel.sum()
-        return kernel.unsqueeze(0).unsqueeze(0)  # [1,1,k,k]
-
-    def _rotate_kernel(self, kernel, angle):
-        """旋转基础核，kernel: [C,1,k,k], angle: scalar Tensor"""
-        C, _, k, _ = kernel.shape
-        device = kernel.device
-        center = (k - 1) / 2.0
-        cos_a = torch.cos(angle)
-        sin_a = torch.sin(angle)
-        theta = torch.tensor([
-            [cos_a, -sin_a, center - cos_a*center + sin_a*center],
-            [sin_a,  cos_a, center - sin_a*center - cos_a*center]
-        ], device=device).unsqueeze(0)  # [1,2,3]
-        kernel_4d = kernel.view(C, 1, k, k)
-        grid = F.affine_grid(theta.expand(C, -1, -1), kernel_4d.size(), align_corners=False)
-        rotated = F.grid_sample(kernel_4d, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
-        return rotated  # [C,1,k,k]
+        # Paper Eq.12-13: single 1×1 conv fuses H+W information
+        self.fuse_conv = nn.Conv2d(channels, channels, 1, bias=False)
+        # Paper Eq.14-15: separate 1×1 convs for H and W attention
+        self.conv_h = nn.Conv2d(channels, channels, 1)
+        self.conv_w = nn.Conv2d(channels, channels, 1)
 
     def forward(self, x):
         B, C, H, W = x.shape
-        assert C == self.in_channels
-        k = self.kernel_size
-        pad = self.padding
 
-        # 1. 计算角度（FFT主轴方向 + 可学习残差 + 固定偏移 π/2）
-        angle_fft = compute_angle_map(x, window_size=k, stride=self.stride)   # [B, H, W]
-        # 注：compute_angle_map 内部已经对输入做了通道均值，所以这里输入 x 可以是任意通道数
-        angle = angle_fft + self.angle_bias + math.pi / 2   # 加 90°
-        angle = angle % math.pi            # 限制到 [0, π)
-        angle = torch.clamp(angle, 0, math.pi - 1e-6)
+        # Paper Eq.11: pool along H and W separately
+        x_h = x.mean(dim=2, keepdim=True)       # [B, C, 1, W]
+        x_w = x.mean(dim=3, keepdim=True)       # [B, C, H, 1]
+        x_w = x_w.permute(0, 1, 3, 2)            # [B, C, 1, H]
 
-        # 2. 预旋转所有离散角度的核
-        pre_rotated = []
-        for i in range(self.num_angles):
-            theta_i = self.angle_grid[i]
-            rot_kernel = self._rotate_kernel(self.base_kernel, theta_i)   # [C,1,k,k]
-            pre_rotated.append(rot_kernel.view(C, k*k))
-        pre_rotated = torch.stack(pre_rotated, dim=0)   # [num_angles, C, k*k]
+        # Concat → 1×1 Conv (Eq.11-12)
+        cat = torch.cat([x_h, x_w], dim=3)       # [B, C, 1, W+H]
+        fused = self.fuse_conv(cat)               # [B, C, 1, W+H]
 
-        # 3. 获取 patches 并展平
-        x_pad = F.pad(x, (pad, pad, pad, pad), mode='reflect')
-        patches = F.unfold(x_pad, kernel_size=k, stride=self.stride)   # [B, C*k*k, N]
-        N = patches.shape[-1]   # H_out * W_out
-        patches = patches.view(B, C, k*k, N).permute(0, 1, 3, 2)        # [B, C, N, k*k]
-        patches_flat = patches.permute(0, 2, 1, 3).reshape(B*N, C, k*k) # [B*N, C, k*k]
+        # Split H/W (Eq.12-13)
+        h_feat = fused[:, :, :, :W]               # [B, C, 1, W]
+        w_feat = fused[:, :, :, W:]               # [B, C, 1, H]
 
-        # 4. 量化角度
-        angle_flat = angle.reshape(-1)   # [B*N]
-        indices = torch.argmin(torch.abs(angle_flat.unsqueeze(1) - self.angle_grid.unsqueeze(0)), dim=1)  # [B*N]
+        # 1×1 Conv + Sigmoid per branch (Eq.14-15)
+        ca_h = self.conv_h(h_feat).sigmoid()      # [B, C, 1, W]
+        ca_w = self.conv_w(w_feat).sigmoid()      # [B, C, 1, H]
 
-        # 5. 向量化深度卷积
-        selected_kernels = pre_rotated[indices]          # [B*N, C, k*k]
-        out_flat = (patches_flat * selected_kernels).sum(dim=2)   # [B*N, C]
-
-        out = out_flat.view(B, C, H, W)
-        return out
+        # Element-wise multiply (Eq.16)
+        return x * ca_h * ca_w.permute(0, 1, 3, 2)
 
 
-class MultiBranchAFE(nn.Module):
+class ARFCBlock(nn.Module):
+    """Adaptive Receptive Field Convolution Block.
+
+    Strictly follows the ARFN-MoE paper (TGRS 2026):
+
+    - LCE:  AvgPool → DWConv(1×K) → DWConv(K×1) → Conv(1×1)
+    - MFE:  N experts, each = pointwise reduce → DWConv(k×k) → CoordAttention
+            → pointwise expand. Kernel sizes and channel counts differ per expert.
+    - Grid Router: cosine similarity + Top-k sparse selection
+    - Balance Loss: CV²
+    - Output: LCE(x) + Σ router_i·MFE_i(x) + x  (residual, no BN/activation)
+
+    Args:
+        channels (int): Input/output channels C.
+        num_experts (int): Number of MFE experts. Default: 4.
+        kernel_sizes (list[int]): DWConv kernel sizes per expert.
+            Default: [3, 5, 7, 9].
+        lce_kernel (int): LCE strip conv kernel size. Default: 11.
+        top_k (int): Top-k experts per grid cell. Default: 3.
+        init_temperature (float): Initial router temperature. Default: 1.0.
     """
-    四分支多尺度方向增强模块：
-      - 分支1：恒等映射
-      - 分支2：1x7 深度可分离卷积（水平）
-      - 分支3：7x1 深度可分离卷积（垂直）
-      - 分支4：角度自适应卷积（旋转核 + 90° 偏移）
-    输入通道假设为 256，被均分为 4 份（每份 64）。
-    """
-    def __init__(self, in_channels=256, kernel_size=7, stride=1, padding=None):
+
+    def __init__(self, channels, num_experts=4, kernel_sizes=None,
+                 lce_kernel=11, top_k=3, init_temperature=1.0):
         super().__init__()
-        assert in_channels % 4 == 0, "in_channels must be divisible by 4"
-        self.in_channels = in_channels
-        self.branch_channels = in_channels // 4   # 64
-        self.kernel_size = kernel_size
-        self.stride = stride
-        if padding is None:
-            padding = kernel_size // 2
-        self.padding = padding
+        self.channels = channels
+        self.num_experts = num_experts
+        self.top_k = min(top_k, num_experts)
 
-        # 分支2: 1x7 深度可分离卷积
-        self.dw_horiz = nn.Conv2d(self.branch_channels, self.branch_channels,
-                                  kernel_size=(1, kernel_size), stride=stride,
-                                  padding=(0, padding), groups=self.branch_channels, bias=False)
-        # 分支3: 7x1 深度可分离卷积
-        self.dw_vert = nn.Conv2d(self.branch_channels, self.branch_channels,
-                                 kernel_size=(kernel_size, 1), stride=stride,
-                                 padding=(padding, 0), groups=self.branch_channels, bias=False)
-        # 分支4: 角度自适应卷积
-        self.angle_conv = AngleAdaptiveConv(self.branch_channels, kernel_size=kernel_size,
-                                            stride=stride, padding=padding)
+        if kernel_sizes is None:
+            kernel_sizes = [(3 + 2 * i) for i in range(num_experts)]
+        self.kernel_sizes = kernel_sizes
 
-        # 融合卷积（1x1）
-        self.fusion = nn.Conv2d(in_channels, in_channels, 1, bias=False)
-        self.bn_fusion = nn.BatchNorm2d(in_channels)
-        self.act = nn.SiLU()
+        # ---- LCE Branch (paper: AvgPool → DWConv 1×K → DWConv K×1 → 1×1 Conv) ----
+        self.lce_avgpool = nn.AvgPool2d(kernel_size=3, stride=1, padding=1)
+        self.lce_strip_h = nn.Conv2d(channels, channels, (1, lce_kernel),
+                                     padding=(0, lce_kernel // 2),
+                                     groups=channels, bias=False)
+        self.lce_strip_w = nn.Conv2d(channels, channels, (lce_kernel, 1),
+                                     padding=(lce_kernel // 2, 0),
+                                     groups=channels, bias=False)
+        self.lce_proj = nn.Conv2d(channels, channels, 1, bias=False)
+
+        # ---- MFE Branch ----
+        # Paper: experts differ in kernel sizes AND channel counts
+        # (small kernel → more channels for fine details;
+        #  large kernel → fewer channels for spatial context)
+        expert_channels = self._compute_expert_channels(channels, num_experts)
+
+        self.expert_reduce = nn.ModuleList()
+        self.expert_dwconv = nn.ModuleList()
+        self.expert_coord_att = nn.ModuleList()
+        self.expert_expand = nn.ModuleList()
+
+        for i in range(num_experts):
+            ec = expert_channels[i]
+            k = kernel_sizes[i]
+            # pointwise reduce: C → ec  (paper: depth-wise separable conv)
+            self.expert_reduce.append(
+                nn.Conv2d(channels, ec, 1, bias=False))
+            # DWConv k×k  (paper Eq.10, no BN, no activation)
+            self.expert_dwconv.append(
+                nn.Conv2d(ec, ec, k, padding=k // 2, groups=ec, bias=False))
+            # Coordinate Attention  (paper Eq.11-16, no BN)
+            self.expert_coord_att.append(CoordAttention(ec))
+            # pointwise expand: ec → C
+            self.expert_expand.append(
+                nn.Conv2d(ec, channels, 1, bias=False))
+
+        # ---- Grid Router (paper Eq.8: cosine similarity + Top-k) ----
+        router_dim = channels // 2
+        self.router_proj = nn.Conv2d(channels, router_dim, 1, bias=False)
+        self.expert_embedding = nn.Parameter(
+            torch.empty(router_dim, num_experts))
+        nn.init.orthogonal_(self.expert_embedding)
+        self.temperature = nn.Parameter(torch.tensor(init_temperature))
+
+        # Register balance loss buffer
+        self.register_buffer('balance_loss', torch.tensor(0.0))
+
+    @staticmethod
+    def _compute_expert_channels(total_ch, num_exp):
+        """Compute per-expert channel counts.
+
+        Paper: "for experts with smaller kernels, we increase the number
+        of channels … for experts with larger kernels, we reduce the
+        channel count."  Expert 0 has smallest kernel → most channels.
+        """
+        if num_exp == 4:
+            ratios = [0.40625, 0.3125, 0.1875, 0.09375]
+        else:
+            raw = [(num_exp - i) for i in range(num_exp)]
+            s = float(sum(raw))
+            ratios = [r / s for r in raw]
+        chs = [max(8, int(total_ch * r + 0.5)) for r in ratios]
+        diff = total_ch - sum(chs)
+        chs[0] += diff
+        return chs
 
     def forward(self, x):
-        # 按通道分割
-        ch = self.branch_channels
-        x1 = x[:, :ch, :, :]          # 恒等
-        x2 = x[:, ch:2*ch, :, :]      # 水平
-        x3 = x[:, 2*ch:3*ch, :, :]    # 垂直
-        x4 = x[:, 3*ch:4*ch, :, :]    # 角度自适应
+        B, C, H, W = x.shape
 
-        # 处理各分支
-        out1 = x1
-        out2 = self.dw_horiz(x2)
-        out3 = self.dw_vert(x3)
-        out4 = self.angle_conv(x4)
+        # ---- LCE: AvgPool → DWConv 1×K → DWConv K×1 → 1×1 Conv ----
+        lce_out = self.lce_avgpool(x)
+        lce_out = self.lce_strip_h(lce_out)
+        lce_out = self.lce_strip_w(lce_out)
+        lce_out = self.lce_proj(lce_out)
 
-        out = torch.cat([out1, out2, out3, out4], dim=1)
-        out = self.fusion(out)
-        out = self.bn_fusion(out)
-        out = self.act(out)
-        return out
+        # ---- Grid Router ----
+        temp = self.temperature.clamp(0.5, 1.5)
+        proj = self.router_proj(x)                               # [B, D, H, W]
+
+        proj_flat = proj.view(B, -1, H * W)                      # [B, D, HW]
+        proj_norm = F.normalize(proj_flat, dim=1)
+        emb_norm = F.normalize(self.expert_embedding, dim=0)     # [D, N]
+
+        sim = torch.bmm(
+            proj_norm.transpose(1, 2),                            # [B, HW, D]
+            emb_norm.unsqueeze(0).expand(B, -1, -1)              # [B, D, N]
+        )                                                         # [B, HW, N]
+        sim = sim.permute(0, 2, 1).view(B, -1, H, W)            # [B, N, H, W]
+
+        router_logits = sim / temp
+        router_prob = F.softmax(router_logits, dim=1)            # [B, N, H, W]
+
+        # Top-k sparse selection with renormalization (paper Eq.8)
+        topk_vals, topk_idx = torch.topk(router_prob, k=self.top_k, dim=1)
+        mask = torch.zeros_like(router_prob)
+        mask.scatter_(1, topk_idx, topk_vals)
+        router_weights = mask / (mask.sum(dim=1, keepdim=True) + 1e-8)
+
+        # Balance Loss: CV² (paper Eq.19)
+        if self.training:
+            p_mean = router_prob.mean(dim=[0, 2, 3])             # [N]
+            cv = p_mean.std() / (p_mean.mean() + 1e-8)
+            self.balance_loss = cv ** 2
+
+        # ---- MFE: scale-specialized experts (paper Eq.9-10) ----
+        mfe_out = 0
+        for i in range(self.num_experts):
+            feat = self.expert_reduce[i](x)           # C → ec_i
+            feat = self.expert_dwconv[i](feat)        # DWConv k_i×k_i
+            feat = self.expert_coord_att[i](feat)     # CoordAttention
+            feat = self.expert_expand[i](feat)        # ec_i → C
+            weight = router_weights[:, i:i + 1, :, :]  # [B, 1, H, W]
+            mfe_out = mfe_out + weight * feat
+
+        # ---- Residual Output (paper Eq.9) ----
+        # y = LCE(x) + Σ router_i·MFE_i(x) + x
+        return lce_out + mfe_out + x
 
 
 @ROTATED_NECKS.register_module()
 class AngleFreqEnhanceFPN(FPN):
+    """FPN enhanced with ARFC-Block from the ARFN-MoE paper.
+
+    Standard FPN top-down pathway with optional ARFC enhancement at
+    each fusion step.
+
+    Args:
+        in_channels (list[int]): Input channels per scale.
+        out_channels (int): Output channels.
+        num_outs (int): Number of output scales.
+        fusion_modes (list[str]): ``'add'`` (standard FPN) or
+            ``'arfc'`` (FPN addition + ARFCBlock).
+        arfc_num_experts (int): MFE experts. Default: 4.
+        arfc_top_k (int): Top-k routing. Default: 3.
+        arfc_lce_kernel (int): LCE strip kernel size. Default: 11.
     """
-    增强版 FPN，支持可配置的 AFE 模块参数。
-    当 fusion_mode 为 'afe' 时，使用 MultiBranchAFE 进行方向增强融合。
-    """
+
     def __init__(self,
                  in_channels,
                  out_channels,
                  num_outs,
                  fusion_modes: List[str],
-                 afe_kernel_size=7,        # 仅保留 kernel_size 参数
+                 arfc_num_experts=4,
+                 arfc_top_k=3,
+                 arfc_lce_kernel=11,
                  **kwargs):
         super().__init__(
             in_channels=in_channels,
@@ -228,54 +238,55 @@ class AngleFreqEnhanceFPN(FPN):
             **kwargs)
 
         self.fusion_modes = fusion_modes
-        self.dynamic_convs = nn.ModuleList()
+        self.arfc_blocks = nn.ModuleList()
+
         for mode in fusion_modes:
-            if mode == 'afe':
-                # 注意：MultiBranchAFE 内部固定输入输出通道数为 out_channels（必须能被 4 整除）
-                assert out_channels % 4 == 0, "out_channels must be divisible by 4 for AFE"
-                self.dynamic_convs.append(
-                    MultiBranchAFE(
-                        in_channels=out_channels,
-                        kernel_size=afe_kernel_size
-                    )
-                )
+            if mode == 'arfc':
+                self.arfc_blocks.append(
+                    ARFCBlock(
+                        channels=out_channels,
+                        num_experts=arfc_num_experts,
+                        top_k=arfc_top_k,
+                        lce_kernel=arfc_lce_kernel,
+                    ))
             else:
-                self.dynamic_convs.append(None)
+                self.arfc_blocks.append(None)
 
     @auto_fp16()
     def forward(self, inputs):
-        # 同原始 FPN 的 lateral 构建
         laterals = [
             lateral_conv(inputs[i + self.start_level])
             for i, lateral_conv in enumerate(self.lateral_convs)
         ]
 
         used_backbone_levels = len(laterals)
-        # 自顶向下融合
         for i in range(used_backbone_levels - 1, 0, -1):
             fusion_idx = used_backbone_levels - 1 - i
             mode = self.fusion_modes[fusion_idx]
 
-            if mode == 'add':
-                if 'scale_factor' in self.upsample_cfg:
-                    upsampled = F.interpolate(laterals[i], **self.upsample_cfg)
-                else:
-                    prev_shape = laterals[i - 1].shape[2:]
-                    upsampled = F.interpolate(laterals[i], size=prev_shape, **self.upsample_cfg)
-                laterals[i - 1] = laterals[i - 1] + upsampled
+            if 'scale_factor' in self.upsample_cfg:
+                up_high = F.interpolate(laterals[i], **self.upsample_cfg)
+            else:
+                prev_shape = laterals[i - 1].shape[2:]
+                up_high = F.interpolate(
+                    laterals[i], size=prev_shape, **self.upsample_cfg)
 
-            elif mode == 'afe':
-                enhanced_low = self.dynamic_convs[fusion_idx](laterals[i - 1])
-                up_high = F.interpolate(laterals[i], size=enhanced_low.shape[-2:], **self.upsample_cfg)
-                laterals[i - 1] = enhanced_low + up_high
+            if mode == 'add':
+                # Standard FPN: lateral + upsampled
+                laterals[i - 1] = laterals[i - 1] + up_high
+
+            elif mode == 'arfc':
+                # FPN addition + ARFC enhancement
+                laterals[i - 1] = laterals[i - 1] + up_high
+                laterals[i - 1] = self.arfc_blocks[fusion_idx](
+                    laterals[i - 1])
 
             else:
                 raise ValueError(f"Unknown fusion mode: {mode}")
 
-        # 输出层
-        outs = [self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)]
+        outs = [self.fpn_convs[i](laterals[i])
+                for i in range(used_backbone_levels)]
 
-        # 生成额外层（同原 FPN）
         if self.num_outs > len(outs):
             if not self.add_extra_convs:
                 for i in range(self.num_outs - used_backbone_levels):
@@ -289,7 +300,8 @@ class AngleFreqEnhanceFPN(FPN):
                     extra_source = outs[-1]
                 else:
                     raise NotImplementedError
-                outs.append(self.fpn_convs[used_backbone_levels](extra_source))
+                outs.append(
+                    self.fpn_convs[used_backbone_levels](extra_source))
                 for i in range(used_backbone_levels + 1, self.num_outs):
                     if self.relu_before_extra_convs:
                         outs.append(self.fpn_convs[i](F.relu(outs[-1])))
@@ -297,3 +309,11 @@ class AngleFreqEnhanceFPN(FPN):
                         outs.append(self.fpn_convs[i](outs[-1]))
 
         return tuple(outs)
+
+    def get_balance_loss(self):
+        """Return accumulated auxiliary balance loss from ARFC blocks."""
+        loss = 0.0
+        for block in self.arfc_blocks:
+            if block is not None:
+                loss = loss + block.balance_loss
+        return loss

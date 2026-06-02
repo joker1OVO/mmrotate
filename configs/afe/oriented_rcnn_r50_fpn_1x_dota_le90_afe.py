@@ -21,13 +21,10 @@ model = dict(
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
         num_outs=5,
-        fusion_modes=['add', 'afe', 'afe'],  # 根据需要设置
-        afe_reduced_channels=16,
-        afe_kernel_list=[5, 7, 9],
-        start_level=0,
-        add_extra_convs='on_output',
-        relu_before_extra_convs=True
-    ),
+        fusion_modes=['add', 'arfc', 'arfc'],  # P5→P4: add, P4→P3: arfc, P3→P2: arfc
+        arfc_num_experts=4,
+        arfc_top_k=3,
+        arfc_lce_kernel=11),
     rpn_head=dict(
         type='OrientedRPNHead',
         in_channels=256,
@@ -146,10 +143,17 @@ train_pipeline = [
     dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels'])
 ]
 data = dict(
-    samples_per_gpu=1,
-    workers_per_gpu=1,
+    samples_per_gpu=2,
+    workers_per_gpu=2,
     train=dict(pipeline=train_pipeline, version=angle_version),
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 
-optimizer = dict(lr=0.0025)
+optimizer = dict(
+    _delete_=True,
+    type='AdamW',
+    lr=0.0001, #/8*gpu_number,
+    betas=(0.9, 0.999),
+    weight_decay=0.05)
+
+# optimizer = dict(lr=0.0025)

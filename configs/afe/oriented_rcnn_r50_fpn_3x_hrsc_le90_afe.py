@@ -1,5 +1,3 @@
-from PIL.ImageOps import scale
-
 _base_ = [
     '../_base_/datasets/hrsc.py', '../_base_/schedules/schedule_3x.py',
     '../_base_/default_runtime.py'
@@ -13,17 +11,20 @@ model = dict(
         depth=50,
         num_stages=4,
         out_indices=(0, 1, 2, 3),
-        frozen_stages=-1,
-        norm_cfg=dict(type='BN', requires_grad=True),  # if more than one gpu, use SyncBN instead of BN
+        frozen_stages=1,
+        norm_cfg=dict(type='BN', requires_grad=True),
         norm_eval=True,
         style='pytorch',
-        init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')
-        ),
+        init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
-        type='noFpn',
-        in_channels=[256, 512, 1024, 2048],  # ResNet50 四个输出
+        type='AngleFreqEnhanceFPN',
+        in_channels=[256, 512, 1024, 2048],
         out_channels=256,
-    ),
+        num_outs=5,
+        fusion_modes=['add', 'arfc', 'arfc'],  # P5→P4: add, P4→P3: arfc, P3→P2: arfc
+        arfc_num_experts=4,
+        arfc_top_k=3,
+        arfc_lce_kernel=11),
     rpn_head=dict(
         type='OrientedRPNHead',
         in_channels=256,
@@ -156,12 +157,11 @@ data = dict(
     val=dict(version=angle_version),
     test=dict(version=angle_version))
 
-# optimizer = dict(
-#     _delete_=True,
-#     type='AdamW',
-#     lr=0.0004,
-#     betas=(0.9, 0.999),
-#     weight_decay=0.05)
+optimizer = dict(
+    _delete_=True,
+    type='AdamW',
+    lr=0.0001,
+    betas=(0.9, 0.999),
+    weight_decay=0.05)
 
-evaluation = dict(interval=1, metric='mAP', start=33)
-optimizer = dict(lr=0.005)
+evaluation = dict(interval=4, metric='mAP')

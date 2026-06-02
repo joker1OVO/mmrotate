@@ -10,6 +10,7 @@ from ...builder import ROTATED_HEADS
 from .rotated_bbox_head import RotatedBBoxHead
 from .reg_block import StripBlock
 
+
 @ROTATED_HEADS.register_module()
 class StripHead_(RotatedBBoxHead):
     r"""More general bbox head, with shared conv and fc layers and two optional
@@ -91,7 +92,7 @@ class StripHead_(RotatedBBoxHead):
         self.reg_xy_wh_convs, self.reg_xy_wh_fcs, self.reg_xy_wh_last_dim = \
             self._add_conv_strip_fc_branch(
                 self.num_reg_xy_wh_convs, self.num_reg_xy_wh_fcs, self.shared_out_channels)
-            
+
         # add reg theta specific branch
         self.reg_theta_convs, self.reg_theta_fcs, self.reg_theta_last_dim = \
             self._add_conv_fc_branch(
@@ -118,9 +119,9 @@ class StripHead_(RotatedBBoxHead):
                 out_features=cls_channels)
         if self.with_reg:
             out_dim_reg_xy_wh = (4 if self.reg_class_agnostic else 4 *
-                           self.num_classes)
+                                                                   self.num_classes)
             out_dim_reg_theta = (1 if self.reg_class_agnostic else 1 *
-                           self.num_classes)
+                                                                   self.num_classes)
             self.fc_reg_xy_wh = build_linear_layer(
                 self.reg_predictor_cfg,
                 in_features=self.reg_xy_wh_last_dim,
@@ -144,10 +145,10 @@ class StripHead_(RotatedBBoxHead):
             ]
 
     def _add_conv_strip_fc_branch(self,
-                            num_branch_convs,
-                            num_branch_fcs,
-                            in_channels,
-                            is_shared=False):
+                                  num_branch_convs,
+                                  num_branch_fcs,
+                                  in_channels,
+                                  is_shared=False):
         """Add shared or separable branch.
 
         convs -> avg pool (optional) -> fcs
@@ -166,7 +167,7 @@ class StripHead_(RotatedBBoxHead):
                         3,
                         padding=1,
                         conv_cfg=self.conv_cfg,
-                        norm_cfg=self.norm_cfg))       
+                        norm_cfg=self.norm_cfg))
                 branch_convs.append(
                     StripBlock(self.conv_out_channels)
                 )
@@ -177,7 +178,7 @@ class StripHead_(RotatedBBoxHead):
             # for shared branch, only consider self.with_avg_pool
             # for separated branches, also consider self.num_shared_fcs
             if (is_shared
-                    or self.num_shared_fcs == 0) and not self.with_avg_pool:
+                or self.num_shared_fcs == 0) and not self.with_avg_pool:
                 last_layer_dim *= self.roi_feat_area
             for i in range(num_branch_fcs):
                 fc_in_channels = (
@@ -218,7 +219,7 @@ class StripHead_(RotatedBBoxHead):
             # for shared branch, only consider self.with_avg_pool
             # for separated branches, also consider self.num_shared_fcs
             if (is_shared
-                    or self.num_shared_fcs == 0) and not self.with_avg_pool:
+                or self.num_shared_fcs == 0) and not self.with_avg_pool:
                 last_layer_dim *= self.roi_feat_area
             for i in range(num_branch_fcs):
                 fc_in_channels = (
@@ -254,17 +255,17 @@ class StripHead_(RotatedBBoxHead):
             x_cls = x_cls.flatten(1)
         for fc in self.cls_fcs:
             x_cls = self.relu(fc(x_cls))
-            
+
         x_reg_xy_wh = x_reg
         for conv in self.reg_xy_wh_convs:
             x_reg_xy_wh = conv(x_reg_xy_wh)
-        
+
         # print(x_reg_xy_wh.shape)
         if x_reg_xy_wh.dim() > 2:
             if self.with_avg_pool:
                 x_reg_xy_wh = self.avg_pool(x_reg_xy_wh)
             x_reg_xy_wh = x_reg_xy_wh.flatten(1)
-            print(x_reg_xy_wh.shape)
+            # print(x_reg_xy_wh.shape)
         for fc in self.reg_xy_wh_fcs:
             x_reg_xy_wh = self.relu(fc(x_reg_xy_wh))
         # print(x_reg_xy_wh.shape)
@@ -278,12 +279,13 @@ class StripHead_(RotatedBBoxHead):
             x_reg_theta = x_reg_theta.flatten(1)
         for fc in self.reg_theta_fcs:
             x_reg_theta = self.relu(fc(x_reg_theta))
-            
+
         cls_score = self.fc_cls(x_cls) if self.with_cls else None
         xy_wh_pred = self.fc_reg_xy_wh(x_reg_xy_wh) if self.with_reg else None
         theta_pred = self.fc_reg_theta(x_reg_theta) if self.with_reg else None
         bbox_pred = torch.cat((xy_wh_pred, theta_pred), dim=1)
         return cls_score, bbox_pred
+
 
 @ROTATED_HEADS.register_module()
 class StripHead(StripHead_):

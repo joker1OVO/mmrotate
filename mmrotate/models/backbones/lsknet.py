@@ -11,6 +11,7 @@ from functools import partial
 import warnings
 from mmcv.cnn import build_norm_layer
 
+
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -37,27 +38,26 @@ class LSKblock(nn.Module):
         super().__init__()
         self.conv0 = nn.Conv2d(dim, dim, 5, padding=2, groups=dim)
         self.conv_spatial = nn.Conv2d(dim, dim, 7, stride=1, padding=9, groups=dim, dilation=3)
-        self.conv1 = nn.Conv2d(dim, dim//2, 1)
-        self.conv2 = nn.Conv2d(dim, dim//2, 1)
+        self.conv1 = nn.Conv2d(dim, dim // 2, 1)
+        self.conv2 = nn.Conv2d(dim, dim // 2, 1)
         self.conv_squeeze = nn.Conv2d(2, 2, 7, padding=3)
-        self.conv = nn.Conv2d(dim//2, dim, 1)
+        self.conv = nn.Conv2d(dim // 2, dim, 1)
 
-    def forward(self, x):   
+    def forward(self, x):
         attn1 = self.conv0(x)
         attn2 = self.conv_spatial(attn1)
 
         attn1 = self.conv1(attn1)
         attn2 = self.conv2(attn2)
-        
+
         attn = torch.cat([attn1, attn2], dim=1)
         avg_attn = torch.mean(attn, dim=1, keepdim=True)
         max_attn, _ = torch.max(attn, dim=1, keepdim=True)
         agg = torch.cat([avg_attn, max_attn], dim=1)
         sig = self.conv_squeeze(agg).sigmoid()
-        attn = attn1 * sig[:,0,:,:].unsqueeze(1) + attn2 * sig[:,1,:,:].unsqueeze(1)
+        attn = attn1 * sig[:, 0, :, :].unsqueeze(1) + attn2 * sig[:, 1, :, :].unsqueeze(1)
         attn = self.conv(attn)
         return x * attn
-
 
 
 class Attention(nn.Module):
@@ -80,7 +80,7 @@ class Attention(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim, mlp_ratio=4., drop=0.,drop_path=0., act_layer=nn.GELU, norm_cfg=None):
+    def __init__(self, dim, mlp_ratio=4., drop=0., drop_path=0., act_layer=nn.GELU, norm_cfg=None):
         super().__init__()
         if norm_cfg:
             self.norm1 = build_norm_layer(norm_cfg, dim)[1]
@@ -92,7 +92,7 @@ class Block(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-        layer_scale_init_value = 1e-2            
+        layer_scale_init_value = 1e-2
         self.layer_scale_1 = nn.Parameter(
             layer_scale_init_value * torch.ones((dim)), requires_grad=True)
         self.layer_scale_2 = nn.Parameter(
@@ -118,23 +118,23 @@ class OverlapPatchEmbed(nn.Module):
         else:
             self.norm = nn.BatchNorm2d(embed_dim)
 
-
     def forward(self, x):
         x = self.proj(x)
         _, _, H, W = x.shape
-        x = self.norm(x)        
+        x = self.norm(x)
         return x, H, W
+
 
 @ROTATED_BACKBONES.register_module()
 class LSKNet(BaseModule):
     def __init__(self, img_size=224, in_chans=3, embed_dims=[64, 128, 256, 512],
-                mlp_ratios=[8, 8, 4, 4], drop_rate=0., drop_path_rate=0., norm_layer=partial(nn.LayerNorm, eps=1e-6),
-                 depths=[3, 4, 6, 3], num_stages=4, 
+                 mlp_ratios=[8, 8, 4, 4], drop_rate=0., drop_path_rate=0., norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                 depths=[3, 4, 6, 3], num_stages=4,
                  pretrained=None,
                  init_cfg=None,
                  norm_cfg=None):
         super().__init__(init_cfg=init_cfg)
-        
+
         assert not (init_cfg and pretrained), \
             'init_cfg and pretrained cannot be set at the same time'
         if isinstance(pretrained, str):
@@ -157,7 +157,7 @@ class LSKNet(BaseModule):
                                             embed_dim=embed_dims[i], norm_cfg=norm_cfg)
 
             block = nn.ModuleList([Block(
-                dim=embed_dims[i], mlp_ratio=mlp_ratios[i], drop=drop_rate, drop_path=dpr[cur + j],norm_cfg=norm_cfg)
+                dim=embed_dims[i], mlp_ratio=mlp_ratios[i], drop=drop_rate, drop_path=dpr[cur + j], norm_cfg=norm_cfg)
                 for j in range(depths[i])])
             norm = norm_layer(embed_dims[i])
             cur += depths[i]
@@ -165,8 +165,6 @@ class LSKNet(BaseModule):
             setattr(self, f"patch_embed{i + 1}", patch_embed)
             setattr(self, f"block{i + 1}", block)
             setattr(self, f"norm{i + 1}", norm)
-
-
 
     def init_weights(self):
         print('init cfg', self.init_cfg)
@@ -184,7 +182,7 @@ class LSKNet(BaseModule):
                         m, mean=0, std=math.sqrt(2.0 / fan_out), bias=0)
         else:
             super(LSKNet, self).init_weights()
-            
+
     def freeze_patch_emb(self):
         self.patch_embed1.requires_grad = False
 
@@ -240,4 +238,3 @@ def _conv_filter(state_dict, patch_size=16):
         out_dict[k] = v
 
     return out_dict
-

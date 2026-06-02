@@ -3,7 +3,7 @@ from mmcv.cnn import ConvModule
 from ..builder import ROTATED_NECKS
 
 @ROTATED_NECKS.register_module()
-class noFpn(nn.Module):
+class nofpn(nn.Module):
     """仅统一通道数并生成第5层，不进行任何融合的多尺度neck。
 
     Args:
