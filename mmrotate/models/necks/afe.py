@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -52,30 +53,239 @@ class CoordAttention(nn.Module):
         return x * ca_h * ca_w.permute(0, 1, 3, 2)
 
 
+class MultiBranchLCE(nn.Module):
+    """Multi-Branch Local Context Enhancement.
+
+    Three branches with **independent** weights, summed and projected:
+
+    1. **Original Strip**: ``1×K`` → ``K×1`` depth-wise strip convs
+       (horizontal + vertical), same as the original LCE without AvgPool.
+
+    2. **Adaptive Rotation**: estimates the principal edge direction via
+       FFT (mirror-padded to suppress spectral leakage), rotates the
+       feature map, applies strip convs, and rotates back.  Angle is
+       per-image global (one scalar per sample).
+
+    3. **Frequency Domain**: ``rfft2 → [Re, Im]``, applies strip convs
+       (shared weights for Re/Im), then ``irfft2`` back to spatial.
+
+    No internal residual connection — the outer :class:`ARFCBlock`
+    provides the ``+ x`` skip.
+
+    Args:
+        channels (int): Input/output channels.
+        strip_kernel (int): DWConv kernel size for spatial branches
+            (1 & 2).  Default: 11.
+        freq_kernel (int): DWConv kernel size for frequency branch
+            (3).  Use small values (e.g. 3) — each frequency bin already
+            represents a global component.  Default: 3.
+        angle_pool_size (int): Target size for ``adaptive_avg_pool2d``
+            before FFT angle estimation.  Default: 64.
+        mirror_pad (int): Mirror-padding width applied before FFT to
+            suppress spectral leakage.  Default: 8.
+    """
+
+    def __init__(self, channels, strip_kernel=11, freq_kernel=3,
+                 angle_pool_size=64, mirror_pad=8):
+        super().__init__()
+        self.angle_pool_size = angle_pool_size
+        self.mirror_pad = mirror_pad
+
+        # ---- Branch 1: original strip ----
+        self.b1_h = nn.Conv2d(channels, channels, (1, strip_kernel),
+                              padding=(0, strip_kernel // 2),
+                              groups=channels, bias=False)
+        self.b1_w = nn.Conv2d(channels, channels, (strip_kernel, 1),
+                              padding=(strip_kernel // 2, 0),
+                              groups=channels, bias=False)
+        self.b1_proj = nn.Conv2d(channels, channels, 1, bias=False)
+
+        # ---- Branch 2: adaptive-rotation strip ----
+        self.b2_h = nn.Conv2d(channels, channels, (1, strip_kernel),
+                              padding=(0, strip_kernel // 2),
+                              groups=channels, bias=False)
+        self.b2_w = nn.Conv2d(channels, channels, (strip_kernel, 1),
+                              padding=(strip_kernel // 2, 0),
+                              groups=channels, bias=False)
+        self.b2_proj = nn.Conv2d(channels, channels, 1, bias=False)
+
+        # ---- Branch 3: frequency-domain strip (Re/Im share weights) ----
+        self.b3_h = nn.Conv2d(channels, channels, (1, freq_kernel),
+                              padding=(0, freq_kernel // 2),
+                              groups=channels, bias=False)
+        self.b3_w = nn.Conv2d(channels, channels, (freq_kernel, 1),
+                              padding=(freq_kernel // 2, 0),
+                              groups=channels, bias=False)
+        self.b3_proj = nn.Conv2d(channels, channels, 1, bias=False)
+
+        # ---- Merge ----
+        self.merge = nn.Conv2d(channels, channels, 1, bias=False)
+
+    # -----------------------------------------------------------------
+    #  Angle estimation
+    # -----------------------------------------------------------------
+
+    def _estimate_principal_angle(self, x):
+        """Estimate the principal *spatial edge* direction via FFT.
+
+        Pipeline:  ``mean(C) → adaptive_pool → mirror_pad → FFT →
+        magnitude → circular-weighted principal direction``.
+
+        The returned angle is the *rotation* needed to align the
+        dominant edge direction with the horizontal axis (so that the
+        ``1×K`` strip conv captures the strongest texture).
+
+        Returns:
+            ``[B]`` tensor of rotation angles in radians.
+        """
+        B, C, H, W = x.shape
+        device = x.device
+
+        # -- 1. Collapse channels & down-sample --
+        x_mean = x.mean(dim=1, keepdim=True)                     # [B, 1, H, W]
+        ps = min(self.angle_pool_size, H, W)
+        x_pool = F.adaptive_avg_pool2d(x_mean, (ps, ps))        # [B, 1, ps, ps]
+
+        # -- 2. Mirror padding to suppress spectral leakage --
+        pad = self.mirror_pad
+        x_pad = F.pad(x_pool, (pad, pad, pad, pad), mode='reflect')
+
+        # -- 3. FFT → magnitude spectrum --
+        x_fft = torch.fft.fft2(x_pad)
+        x_fft_s = torch.fft.fftshift(x_fft, dim=(-2, -1))
+        mag = x_fft_s.abs() + 1e-8                               # [B, 1, Hf, Wf]
+
+        # -- 4. Frequency coordinate grids --
+        Hf, Wf = mag.shape[-2], mag.shape[-1]
+        fy = torch.arange(Hf, device=device, dtype=torch.float32) - Hf / 2.0
+        fx = torch.arange(Wf, device=device, dtype=torch.float32) - Wf / 2.0
+        fy_g, fx_g = torch.meshgrid(fy, fx, indexing='ij')
+
+        radius = torch.sqrt(fy_g ** 2 + fx_g ** 2)
+        freq_angle = torch.atan2(fy_g, fx_g)                     # [-π, π]
+
+        # Mask: exclude DC and extreme high frequencies
+        mask = (radius > 1.0) & (radius < max(Hf, Wf) * 0.4)
+
+        # Weight by magnitude × radius (edges concentrate at mid-high freq)
+        weighted = mag[:, 0] * radius.unsqueeze(0) * mask.unsqueeze(0)
+
+        # -- 5. Double-angle circular statistics (edge dir is π-periodic) --
+        cos2 = torch.cos(2.0 * freq_angle)
+        sin2 = torch.sin(2.0 * freq_angle)
+        w_cos = (weighted * cos2).sum(dim=(-2, -1))
+        w_sin = (weighted * sin2).sum(dim=(-2, -1))
+        freq_dir = 0.5 * torch.atan2(w_sin, w_cos)               # [B]
+
+        # Spatial edge direction ⊥ frequency direction.
+        # Rotate *negatively* so the dominant edge aligns with the
+        # horizontal strip axis.
+        spatial_edge = freq_dir + math.pi / 2.0
+        return -spatial_edge
+
+    # -----------------------------------------------------------------
+    #  Spatial rotation (bilinear interpolation)
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _rotate(x, angles):
+        """Rotate feature map by per-sample angles.
+
+        Args:
+            x: ``[B, C, H, W]``
+            angles: ``[B]`` radians, CCW positive.
+        Returns:
+            ``[B, C, H, W]``
+        """
+        B, C, H, W = x.shape
+        device = x.device
+
+        cos_a = torch.cos(angles)
+        sin_a = torch.sin(angles)
+
+        theta = torch.zeros(B, 2, 3, device=device)
+        theta[:, 0, 0] = cos_a
+        theta[:, 0, 1] = -sin_a
+        theta[:, 1, 0] = sin_a
+        theta[:, 1, 1] = cos_a
+
+        cx = (W - 1) / 2.0
+        cy = (H - 1) / 2.0
+        theta[:, 0, 2] = cx - cos_a * cx + sin_a * cy
+        theta[:, 1, 2] = cy - sin_a * cx - cos_a * cy
+
+        grid = F.affine_grid(theta, torch.Size([B, C, H, W]),
+                             align_corners=False)
+        return F.grid_sample(x, grid, mode='bilinear',
+                             padding_mode='zeros', align_corners=False)
+
+    # -----------------------------------------------------------------
+    #  Forward
+    # -----------------------------------------------------------------
+
+    def forward(self, x):
+        # ---- Branch 1: original strip ----
+        b1 = self.b1_h(x)
+        b1 = self.b1_w(b1)
+        b1 = self.b1_proj(b1)
+
+        # ---- Branch 2: adaptive rotation ----
+        angles = self._estimate_principal_angle(x)
+        x_rot = self._rotate(x, angles)
+        b2 = self.b2_h(x_rot)
+        b2 = self.b2_w(b2)
+        b2 = self._rotate(b2, -angles)
+        b2 = self.b2_proj(b2)
+
+        # ---- Branch 3: frequency domain ----
+        x_fft = torch.fft.rfft2(x)                     # [B, C, H, W//2+1]
+        x_re, x_im = x_fft.real, x_fft.imag
+
+        re_h = self.b3_h(x_re)
+        re_hw = self.b3_w(re_h)
+        im_h = self.b3_h(x_im)
+        im_hw = self.b3_w(im_h)
+
+        x_freq = torch.complex(re_hw, im_hw)
+        b3 = torch.fft.irfft2(x_freq, s=(x.shape[2], x.shape[3]))
+        b3 = self.b3_proj(b3)
+
+        # ---- Merge ----
+        return self.merge(b1 + b2 + b3)
+
+
 class ARFCBlock(nn.Module):
     """Adaptive Receptive Field Convolution Block.
 
-    Strictly follows the ARFN-MoE paper (TGRS 2026):
+    Based on the ARFN-MoE paper (TGRS 2026), with enhanced LCE:
 
-    - LCE:  AvgPool → DWConv(1×K) → DWConv(K×1) → Conv(1×1)
-    - MFE:  N experts, each = pointwise reduce → DWConv(k×k) → CoordAttention
-            → pointwise expand. Kernel sizes and channel counts differ per expert.
-    - Grid Router: cosine similarity + Top-k sparse selection
-    - Balance Loss: CV²
-    - Output: LCE(x) + Σ router_i·MFE_i(x) + x  (residual, no BN/activation)
+    - **LCE**: :class:`MultiBranchLCE` — three parallel branches
+      (original strip, adaptive-rotation strip, frequency-domain strip)
+      → summed → ``1×1`` projection.
+    - **MFE**:  N experts, each = pointwise reduce → DWConv(k×k) →
+      CoordAttention → pointwise expand. Kernel sizes and channel counts
+      differ per expert.
+    - **Grid Router**: cosine similarity + Top-k sparse selection.
+    - **Balance Loss**: CV².
+    - **Output**: ``LCE(x) + Σ router_i·MFE_i(x) + x``  (residual, no
+      BN/activation).
 
     Args:
         channels (int): Input/output channels C.
         num_experts (int): Number of MFE experts. Default: 4.
         kernel_sizes (list[int]): DWConv kernel sizes per expert.
             Default: [3, 5, 7, 9].
-        lce_kernel (int): LCE strip conv kernel size. Default: 11.
+        lce_kernel (int): Spatial strip conv kernel size (branch 1 & 2).
+            Default: 11.
+        lce_freq_kernel (int): Frequency-domain strip conv kernel size
+            (branch 3).  Default: 3.
         top_k (int): Top-k experts per grid cell. Default: 3.
         init_temperature (float): Initial router temperature. Default: 1.0.
     """
 
     def __init__(self, channels, num_experts=4, kernel_sizes=None,
-                 lce_kernel=11, top_k=3, init_temperature=1.0):
+                 lce_kernel=11, lce_freq_kernel=3, top_k=3,
+                 init_temperature=1.0):
         super().__init__()
         self.channels = channels
         self.num_experts = num_experts
@@ -85,15 +295,10 @@ class ARFCBlock(nn.Module):
             kernel_sizes = [(3 + 2 * i) for i in range(num_experts)]
         self.kernel_sizes = kernel_sizes
 
-        # ---- LCE Branch (paper: AvgPool → DWConv 1×K → DWConv K×1 → 1×1 Conv) ----
-        self.lce_avgpool = nn.AvgPool2d(kernel_size=3, stride=1, padding=1)
-        self.lce_strip_h = nn.Conv2d(channels, channels, (1, lce_kernel),
-                                     padding=(0, lce_kernel // 2),
-                                     groups=channels, bias=False)
-        self.lce_strip_w = nn.Conv2d(channels, channels, (lce_kernel, 1),
-                                     padding=(lce_kernel // 2, 0),
-                                     groups=channels, bias=False)
-        self.lce_proj = nn.Conv2d(channels, channels, 1, bias=False)
+        # ---- Multi-Branch LCE ---- (replaces the original single-branch LCE)
+        self.lce = MultiBranchLCE(
+            channels, strip_kernel=lce_kernel,
+            freq_kernel=lce_freq_kernel)
 
         # ---- MFE Branch ----
         # Paper: experts differ in kernel sizes AND channel counts
@@ -154,11 +359,8 @@ class ARFCBlock(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
 
-        # ---- LCE: AvgPool → DWConv 1×K → DWConv K×1 → 1×1 Conv ----
-        lce_out = self.lce_avgpool(x)
-        lce_out = self.lce_strip_h(lce_out)
-        lce_out = self.lce_strip_w(lce_out)
-        lce_out = self.lce_proj(lce_out)
+        # ---- Multi-Branch LCE ----
+        lce_out = self.lce(x)
 
         # ---- Grid Router ----
         temp = self.temperature.clamp(0.5, 1.5)
@@ -230,6 +432,7 @@ class AngleFreqEnhanceFPN(FPN):
                  arfc_num_experts=4,
                  arfc_top_k=3,
                  arfc_lce_kernel=11,
+                 arfc_lce_freq_kernel=3,
                  **kwargs):
         super().__init__(
             in_channels=in_channels,
@@ -248,6 +451,7 @@ class AngleFreqEnhanceFPN(FPN):
                         num_experts=arfc_num_experts,
                         top_k=arfc_top_k,
                         lce_kernel=arfc_lce_kernel,
+                        lce_freq_kernel=arfc_lce_freq_kernel,
                     ))
             else:
                 self.arfc_blocks.append(None)
