@@ -4,6 +4,7 @@ _base_ = [
 ]
 
 angle_version = 'le90'
+find_unused_parameters=True
 model = dict(
     type='OrientedRCNN',
     backbone=dict(
@@ -12,19 +13,20 @@ model = dict(
         num_stages=4,
         out_indices=(0, 1, 2, 3),
         frozen_stages=1,
-        norm_cfg=dict(type='BN', requires_grad=True),
+        norm_cfg=dict(type='BN', requires_grad=True),  # if more than one gpu, use SyncBN instead of BN
         norm_eval=True,
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
-        type='AngleFreqEnhanceFPN',
+        type='FAAFusionFPN',
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
         num_outs=5,
-        fusion_modes=['add', 'arfc', 'arfc'],  # P5→P4: add, P4→P3: arfc, P3→P2: arfc
-        arfc_num_experts=4,
-        arfc_top_k=3,
-        arfc_lce_kernel=11),
+        fusion_modes=['add', 'add', 'faa'],  # P5→P4: add, P4→P3: add, P3→P2: faa
+        start_level=0,
+        end_level=-1,
+        add_extra_convs='on_input',
+        fam_cfg=dict(m=7, c_mid=64)),
     rpn_head=dict(
         type='OrientedRPNHead',
         in_channels=256,
@@ -56,7 +58,7 @@ model = dict(
             out_channels=256,
             featmap_strides=[4, 8, 16, 32]),
         bbox_head=dict(
-            type='RotatedShared2FCBBoxHead',
+            type='FAAHead',
             in_channels=256,
             fc_out_channels=1024,
             roi_feat_size=7,
@@ -137,13 +139,21 @@ train_pipeline = [
         flip_ratio=[0.25, 0.25, 0.25],
         direction=['horizontal', 'vertical', 'diagonal'],
         version=angle_version),
+    dict(
+        type='PolyRandomRotate',
+        rotate_ratio=0.5,
+        angles_range=180,
+        auto_bound=False,
+        rect_classes=[9, 11],
+        version=angle_version),
     dict(type='Normalize', **img_norm_cfg),
     dict(type='Pad', size_divisor=32),
     dict(type='DefaultFormatBundle'),
     dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels'])
 ]
+
 data = dict(
-    samples_per_gpu=1,
+    samples_per_gpu=2,
     workers_per_gpu=2,
     train=dict(pipeline=train_pipeline, version=angle_version),
     val=dict(version=angle_version),
@@ -156,4 +166,3 @@ optimizer = dict(
     betas=(0.9, 0.999),
     weight_decay=0.05)
 
-# optimizer = dict(lr=0.0025)

@@ -30,10 +30,7 @@ pip install -v -e .
 pip uninstall -y yapf
 pip install yapf==0.40.1
 
-# 11. 安装 send2trash（可选，用于删除文件到回收站）
-pip install send2trash
+pip install scipy shapely matplotlib opencv-python pandas timm einops
 
-# 12. 安装 DOTA_devkit（用于结果合并）
-mkdir -p tools/DOTA_devkit
-git clone https://github.com/CAPTAIN-WHU/DOTA_devkit.git tools/DOTA_devkit
-pip install scipy shapely matplotlib opencv-python pandas
+#4090等卡的cufft问题（一般无需安装）
+conda install cudatoolkit=11.8.0

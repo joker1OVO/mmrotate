@@ -56,7 +56,8 @@ class CoordAttention(nn.Module):
 class MultiBranchLCE(nn.Module):
     """Multi-Branch Local Context Enhancement.
 
-    Three branches with **independent** weights, summed and projected:
+    Three branches with **independent** weights, summed and projected
+    through a single ``1×1`` convolution:
 
     1. **Original Strip**: ``1×K`` → ``K×1`` depth-wise strip convs
        (horizontal + vertical), same as the original LCE without AvgPool.
@@ -68,6 +69,9 @@ class MultiBranchLCE(nn.Module):
 
     3. **Frequency Domain**: ``rfft2 → [Re, Im]``, applies strip convs
        (shared weights for Re/Im), then ``irfft2`` back to spatial.
+
+    **Fusion**: branch outputs are **summed** (plain addition, no weights),
+    then projected through a single ``1×1`` conv.
 
     No internal residual connection — the outer :class:`ARFCBlock`
     provides the ``+ x`` skip.
@@ -86,40 +90,51 @@ class MultiBranchLCE(nn.Module):
     """
 
     def __init__(self, channels, strip_kernel=11, freq_kernel=3,
-                 angle_pool_size=64, mirror_pad=8):
+                 angle_pool_size=64, mirror_pad=8,
+                 enable_b1=True, enable_b2=True, enable_b3=True):
         super().__init__()
         self.angle_pool_size = angle_pool_size
         self.mirror_pad = mirror_pad
+        self.enable_b1 = enable_b1
+        self.enable_b2 = enable_b2
+        self.enable_b3 = enable_b3
 
         # ---- Branch 1: original strip ----
-        self.b1_h = nn.Conv2d(channels, channels, (1, strip_kernel),
-                              padding=(0, strip_kernel // 2),
-                              groups=channels, bias=False)
-        self.b1_w = nn.Conv2d(channels, channels, (strip_kernel, 1),
-                              padding=(strip_kernel // 2, 0),
-                              groups=channels, bias=False)
-        self.b1_proj = nn.Conv2d(channels, channels, 1, bias=False)
+        if enable_b1:
+            self.b1_h = nn.Conv2d(channels, channels, (1, strip_kernel),
+                                  padding=(0, strip_kernel // 2),
+                                  groups=channels, bias=False)
+            self.b1_w = nn.Conv2d(channels, channels, (strip_kernel, 1),
+                                  padding=(strip_kernel // 2, 0),
+                                  groups=channels, bias=False)
+            self.b1_proj = nn.Conv2d(channels, channels, 1, bias=False)
 
         # ---- Branch 2: adaptive-rotation strip ----
-        self.b2_h = nn.Conv2d(channels, channels, (1, strip_kernel),
-                              padding=(0, strip_kernel // 2),
-                              groups=channels, bias=False)
-        self.b2_w = nn.Conv2d(channels, channels, (strip_kernel, 1),
-                              padding=(strip_kernel // 2, 0),
-                              groups=channels, bias=False)
-        self.b2_proj = nn.Conv2d(channels, channels, 1, bias=False)
+        if enable_b2:
+            self.b2_h = nn.Conv2d(channels, channels, (1, strip_kernel),
+                                  padding=(0, strip_kernel // 2),
+                                  groups=channels, bias=False)
+            self.b2_w = nn.Conv2d(channels, channels, (strip_kernel, 1),
+                                  padding=(strip_kernel // 2, 0),
+                                  groups=channels, bias=False)
+            self.b2_proj = nn.Conv2d(channels, channels, 1, bias=False)
 
         # ---- Branch 3: frequency-domain strip (Re/Im share weights) ----
-        self.b3_h = nn.Conv2d(channels, channels, (1, freq_kernel),
-                              padding=(0, freq_kernel // 2),
-                              groups=channels, bias=False)
-        self.b3_w = nn.Conv2d(channels, channels, (freq_kernel, 1),
-                              padding=(freq_kernel // 2, 0),
-                              groups=channels, bias=False)
-        self.b3_proj = nn.Conv2d(channels, channels, 1, bias=False)
+        if enable_b3:
+            self.b3_h = nn.Conv2d(channels, channels, (1, freq_kernel),
+                                  padding=(0, freq_kernel // 2),
+                                  groups=channels, bias=False)
+            self.b3_w = nn.Conv2d(channels, channels, (freq_kernel, 1),
+                                  padding=(freq_kernel // 2, 0),
+                                  groups=channels, bias=False)
+            self.b3_proj = nn.Conv2d(channels, channels, 1, bias=False)
 
-        # ---- Merge ----
-        self.merge = nn.Conv2d(channels, channels, 1, bias=False)
+        # ---- Merge (sum → 1×1, only needed when 2+ branches active) ----
+        active_count = sum([enable_b1, enable_b2, enable_b3])
+        if active_count >= 2:
+            self.merge = nn.Conv2d(channels, channels, 1, bias=False)
+        else:
+            self.merge = None
 
     # -----------------------------------------------------------------
     #  Angle estimation
@@ -223,35 +238,53 @@ class MultiBranchLCE(nn.Module):
     #  Forward
     # -----------------------------------------------------------------
 
+    # -----------------------------------------------------------------
+    #  Forward
+    # -----------------------------------------------------------------
+
     def forward(self, x):
+        outputs = []
+
         # ---- Branch 1: original strip ----
-        b1 = self.b1_h(x)
-        b1 = self.b1_w(b1)
-        b1 = self.b1_proj(b1)
+        if self.enable_b1:
+            b1 = self.b1_h(x)
+            b1 = self.b1_w(b1)
+            b1 = self.b1_proj(b1)
+            outputs.append(b1)
 
         # ---- Branch 2: adaptive rotation ----
-        angles = self._estimate_principal_angle(x)
-        x_rot = self._rotate(x, angles)
-        b2 = self.b2_h(x_rot)
-        b2 = self.b2_w(b2)
-        b2 = self._rotate(b2, -angles)
-        b2 = self.b2_proj(b2)
+        if self.enable_b2:
+            angles = self._estimate_principal_angle(x)
+            x_rot = self._rotate(x, angles)
+            b2 = self.b2_h(x_rot)
+            b2 = self.b2_w(b2)
+            b2 = self._rotate(b2, -angles)
+            b2 = self.b2_proj(b2)
+            outputs.append(b2)
 
         # ---- Branch 3: frequency domain ----
-        x_fft = torch.fft.rfft2(x)                     # [B, C, H, W//2+1]
-        x_re, x_im = x_fft.real, x_fft.imag
+        if self.enable_b3:
+            x_fft = torch.fft.rfft2(x)                     # [B, C, H, W//2+1]
+            x_re, x_im = x_fft.real, x_fft.imag
 
-        re_h = self.b3_h(x_re)
-        re_hw = self.b3_w(re_h)
-        im_h = self.b3_h(x_im)
-        im_hw = self.b3_w(im_h)
+            re_h = self.b3_h(x_re)
+            re_hw = self.b3_w(re_h)
+            im_h = self.b3_h(x_im)
+            im_hw = self.b3_w(im_h)
 
-        x_freq = torch.complex(re_hw, im_hw)
-        b3 = torch.fft.irfft2(x_freq, s=(x.shape[2], x.shape[3]))
-        b3 = self.b3_proj(b3)
+            x_freq = torch.complex(re_hw, im_hw)
+            b3 = torch.fft.irfft2(x_freq, s=(x.shape[2], x.shape[3]))
+            b3 = self.b3_proj(b3)
+            outputs.append(b3)
 
-        # ---- Merge ----
-        return self.merge(b1 + b2 + b3)
+        # ---- Merge (sum → 1×1) ----
+        if len(outputs) >= 2:
+            out = sum(outputs)
+            if self.merge is not None:
+                out = self.merge(out)
+            return out
+        else:
+            return outputs[0]
 
 
 class ARFCBlock(nn.Module):
@@ -285,11 +318,14 @@ class ARFCBlock(nn.Module):
 
     def __init__(self, channels, num_experts=4, kernel_sizes=None,
                  lce_kernel=11, lce_freq_kernel=3, top_k=3,
-                 init_temperature=1.0):
+                 init_temperature=1.0,
+                 lce_enable_b1=True, lce_enable_b2=True, lce_enable_b3=True,
+                 enable_mfe=True):
         super().__init__()
         self.channels = channels
         self.num_experts = num_experts
         self.top_k = min(top_k, num_experts)
+        self.enable_mfe = enable_mfe
 
         if kernel_sizes is None:
             kernel_sizes = [(3 + 2 * i) for i in range(num_experts)]
@@ -298,41 +334,45 @@ class ARFCBlock(nn.Module):
         # ---- Multi-Branch LCE ---- (replaces the original single-branch LCE)
         self.lce = MultiBranchLCE(
             channels, strip_kernel=lce_kernel,
-            freq_kernel=lce_freq_kernel)
+            freq_kernel=lce_freq_kernel,
+            enable_b1=lce_enable_b1,
+            enable_b2=lce_enable_b2,
+            enable_b3=lce_enable_b3)
 
-        # ---- MFE Branch ----
-        # Paper: experts differ in kernel sizes AND channel counts
-        # (small kernel → more channels for fine details;
-        #  large kernel → fewer channels for spatial context)
-        expert_channels = self._compute_expert_channels(channels, num_experts)
+        # ---- MFE Branch (only when enabled) ----
+        if enable_mfe:
+            # Paper: experts differ in kernel sizes AND channel counts
+            # (small kernel → more channels for fine details;
+            #  large kernel → fewer channels for spatial context)
+            expert_channels = self._compute_expert_channels(channels, num_experts)
 
-        self.expert_reduce = nn.ModuleList()
-        self.expert_dwconv = nn.ModuleList()
-        self.expert_coord_att = nn.ModuleList()
-        self.expert_expand = nn.ModuleList()
+            self.expert_reduce = nn.ModuleList()
+            self.expert_dwconv = nn.ModuleList()
+            self.expert_coord_att = nn.ModuleList()
+            self.expert_expand = nn.ModuleList()
 
-        for i in range(num_experts):
-            ec = expert_channels[i]
-            k = kernel_sizes[i]
-            # pointwise reduce: C → ec  (paper: depth-wise separable conv)
-            self.expert_reduce.append(
-                nn.Conv2d(channels, ec, 1, bias=False))
-            # DWConv k×k  (paper Eq.10, no BN, no activation)
-            self.expert_dwconv.append(
-                nn.Conv2d(ec, ec, k, padding=k // 2, groups=ec, bias=False))
-            # Coordinate Attention  (paper Eq.11-16, no BN)
-            self.expert_coord_att.append(CoordAttention(ec))
-            # pointwise expand: ec → C
-            self.expert_expand.append(
-                nn.Conv2d(ec, channels, 1, bias=False))
+            for i in range(num_experts):
+                ec = expert_channels[i]
+                k = kernel_sizes[i]
+                # pointwise reduce: C → ec  (paper: depth-wise separable conv)
+                self.expert_reduce.append(
+                    nn.Conv2d(channels, ec, 1, bias=False))
+                # DWConv k×k  (paper Eq.10, no BN, no activation)
+                self.expert_dwconv.append(
+                    nn.Conv2d(ec, ec, k, padding=k // 2, groups=ec, bias=False))
+                # Coordinate Attention  (paper Eq.11-16, no BN)
+                self.expert_coord_att.append(CoordAttention(ec))
+                # pointwise expand: ec → C
+                self.expert_expand.append(
+                    nn.Conv2d(ec, channels, 1, bias=False))
 
-        # ---- Grid Router (paper Eq.8: cosine similarity + Top-k) ----
-        router_dim = channels // 2
-        self.router_proj = nn.Conv2d(channels, router_dim, 1, bias=False)
-        self.expert_embedding = nn.Parameter(
-            torch.empty(router_dim, num_experts))
-        nn.init.orthogonal_(self.expert_embedding)
-        self.temperature = nn.Parameter(torch.tensor(init_temperature))
+            # ---- Grid Router (paper Eq.8: cosine similarity + Top-k) ----
+            router_dim = channels // 2
+            self.router_proj = nn.Conv2d(channels, router_dim, 1, bias=False)
+            self.expert_embedding = nn.Parameter(
+                torch.empty(router_dim, num_experts))
+            nn.init.orthogonal_(self.expert_embedding)
+            self.temperature = nn.Parameter(torch.tensor(init_temperature))
 
         # Register balance loss buffer
         self.register_buffer('balance_loss', torch.tensor(0.0))
@@ -357,49 +397,52 @@ class ARFCBlock(nn.Module):
         return chs
 
     def forward(self, x):
-        B, C, H, W = x.shape
-
         # ---- Multi-Branch LCE ----
         lce_out = self.lce(x)
 
-        # ---- Grid Router ----
-        temp = self.temperature.clamp(0.5, 1.5)
-        proj = self.router_proj(x)                               # [B, D, H, W]
+        # ---- MFE: scale-specialized experts with Grid Router ----
+        if self.enable_mfe:
+            B, C, H, W = x.shape
 
-        proj_flat = proj.view(B, -1, H * W)                      # [B, D, HW]
-        proj_norm = F.normalize(proj_flat, dim=1)
-        emb_norm = F.normalize(self.expert_embedding, dim=0)     # [D, N]
+            # ---- Grid Router (cosine similarity + Top-k) ----
+            temp = self.temperature.clamp(0.5, 1.5)
+            proj = self.router_proj(x)                               # [B, D, H, W]
 
-        sim = torch.bmm(
-            proj_norm.transpose(1, 2),                            # [B, HW, D]
-            emb_norm.unsqueeze(0).expand(B, -1, -1)              # [B, D, N]
-        )                                                         # [B, HW, N]
-        sim = sim.permute(0, 2, 1).view(B, -1, H, W)            # [B, N, H, W]
+            proj_flat = proj.view(B, -1, H * W)                      # [B, D, HW]
+            proj_norm = F.normalize(proj_flat, dim=1)
+            emb_norm = F.normalize(self.expert_embedding, dim=0)     # [D, N]
 
-        router_logits = sim / temp
-        router_prob = F.softmax(router_logits, dim=1)            # [B, N, H, W]
+            sim = torch.bmm(
+                proj_norm.transpose(1, 2),                            # [B, HW, D]
+                emb_norm.unsqueeze(0).expand(B, -1, -1)              # [B, D, N]
+            )                                                         # [B, HW, N]
+            sim = sim.permute(0, 2, 1).view(B, -1, H, W)            # [B, N, H, W]
 
-        # Top-k sparse selection with renormalization (paper Eq.8)
-        topk_vals, topk_idx = torch.topk(router_prob, k=self.top_k, dim=1)
-        mask = torch.zeros_like(router_prob)
-        mask.scatter_(1, topk_idx, topk_vals)
-        router_weights = mask / (mask.sum(dim=1, keepdim=True) + 1e-8)
+            router_logits = sim / temp
+            router_prob = F.softmax(router_logits, dim=1)            # [B, N, H, W]
 
-        # Balance Loss: CV² (paper Eq.19)
-        if self.training:
-            p_mean = router_prob.mean(dim=[0, 2, 3])             # [N]
-            cv = p_mean.std() / (p_mean.mean() + 1e-8)
-            self.balance_loss = cv ** 2
+            # Top-k sparse selection with renormalization (paper Eq.8)
+            topk_vals, topk_idx = torch.topk(router_prob, k=self.top_k, dim=1)
+            mask = torch.zeros_like(router_prob)
+            mask.scatter_(1, topk_idx, topk_vals)
+            router_weights = mask / (mask.sum(dim=1, keepdim=True) + 1e-8)
 
-        # ---- MFE: scale-specialized experts (paper Eq.9-10) ----
-        mfe_out = 0
-        for i in range(self.num_experts):
-            feat = self.expert_reduce[i](x)           # C → ec_i
-            feat = self.expert_dwconv[i](feat)        # DWConv k_i×k_i
-            feat = self.expert_coord_att[i](feat)     # CoordAttention
-            feat = self.expert_expand[i](feat)        # ec_i → C
-            weight = router_weights[:, i:i + 1, :, :]  # [B, 1, H, W]
-            mfe_out = mfe_out + weight * feat
+            # Balance Loss: CV² (paper Eq.19)
+            if self.training:
+                p_mean = router_prob.mean(dim=[0, 2, 3])             # [N]
+                cv = p_mean.std() / (p_mean.mean() + 1e-8)
+                self.balance_loss = cv ** 2
+
+            mfe_out = 0
+            for i in range(self.num_experts):
+                feat = self.expert_reduce[i](x)           # C → ec_i
+                feat = self.expert_dwconv[i](feat)        # DWConv k_i×k_i
+                feat = self.expert_coord_att[i](feat)     # CoordAttention
+                feat = self.expert_expand[i](feat)        # ec_i → C
+                weight = router_weights[:, i:i + 1, :, :]  # [B, 1, H, W]
+                mfe_out = mfe_out + weight * feat
+        else:
+            mfe_out = 0
 
         # ---- Residual Output (paper Eq.9) ----
         # y = LCE(x) + Σ router_i·MFE_i(x) + x
@@ -433,6 +476,10 @@ class AngleFreqEnhanceFPN(FPN):
                  arfc_top_k=3,
                  arfc_lce_kernel=11,
                  arfc_lce_freq_kernel=3,
+                 lce_enable_b1=True,
+                 lce_enable_b2=True,
+                 lce_enable_b3=True,
+                 arfc_enable_mfe=True,
                  **kwargs):
         super().__init__(
             in_channels=in_channels,
@@ -452,6 +499,10 @@ class AngleFreqEnhanceFPN(FPN):
                         top_k=arfc_top_k,
                         lce_kernel=arfc_lce_kernel,
                         lce_freq_kernel=arfc_lce_freq_kernel,
+                        lce_enable_b1=lce_enable_b1,
+                        lce_enable_b2=lce_enable_b2,
+                        lce_enable_b3=lce_enable_b3,
+                        enable_mfe=arfc_enable_mfe,
                     ))
             else:
                 self.arfc_blocks.append(None)
@@ -480,10 +531,10 @@ class AngleFreqEnhanceFPN(FPN):
                 laterals[i - 1] = laterals[i - 1] + up_high
 
             elif mode == 'arfc':
-                # FPN addition + ARFC enhancement
+                # ARFC enhancement on upsampled high-level feature
+                # before fusion with low-level lateral feature
+                up_high = self.arfc_blocks[fusion_idx](up_high)
                 laterals[i - 1] = laterals[i - 1] + up_high
-                laterals[i - 1] = self.arfc_blocks[fusion_idx](
-                    laterals[i - 1])
 
             else:
                 raise ValueError(f"Unknown fusion mode: {mode}")
@@ -515,7 +566,7 @@ class AngleFreqEnhanceFPN(FPN):
         return tuple(outs)
 
     def get_balance_loss(self):
-        """Return accumulated auxiliary balance loss from ARFC blocks."""
+        """Return accumulated balance loss (CV²) from ARFC blocks."""
         loss = 0.0
         for block in self.arfc_blocks:
             if block is not None:

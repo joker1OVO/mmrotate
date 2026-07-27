@@ -1,5 +1,5 @@
 _base_ = [
-    '../_base_/datasets/dotav1.py', '../_base_/schedules/schedule_1x.py',
+    '../_base_/datasets/hrsc.py', '../_base_/schedules/schedule_3x.py',
     '../_base_/default_runtime.py'
 ]
 
@@ -17,11 +17,18 @@ model = dict(
         style='pytorch',
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
-        type='HSFPN',
+        type='SAFEFPN',
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
         num_outs=5,
-        sdp_layers=[0,1]),
+        fusion_modes=['safe', 'safe', 'safe'],
+        safe_strip_kernel=11,
+        safe_enable_lce=True,   # 旋转分支①: 大核/水平条带 (原始特征, 不旋转)
+        safe_enable_a2rc=True,  # 旋转分支②: FFT自适应旋转 + 条带卷积
+        safe_enable_rot45=True, # 旋转分支③: 固定45°旋转 + 条带卷积
+        safe_enable_fdsc=True,  # 频域分支: 频域条带卷积 (独立)
+        safe_enable_large_kernel=True,  # 大核卷积分支: 3并行深度可分离大核卷积 (k=5,7,9)
+        safe_large_kernels=[5, 7, 9]),
     rpn_head=dict(
         type='OrientedRPNHead',
         in_channels=256,
@@ -57,7 +64,7 @@ model = dict(
             in_channels=256,
             fc_out_channels=1024,
             roi_feat_size=7,
-            num_classes=15,
+            num_classes=1,
             bbox_coder=dict(
                 type='DeltaXYWHAOBBoxCoder',
                 angle_range=angle_version,
@@ -128,18 +135,37 @@ img_norm_cfg = dict(
 train_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='LoadAnnotations', with_bbox=True),
-    dict(type='RResize', img_scale=(1024, 1024)),
+    dict(type='RResize', img_scale=(800, 800)),
     dict(
         type='RRandomFlip',
         flip_ratio=[0.25, 0.25, 0.25],
         direction=['horizontal', 'vertical', 'diagonal'],
+        version=angle_version),
+    dict(
+        type='PolyRandomRotate',
+        rotate_ratio=0.5,
+        angles_range=180,
+        auto_bound=False,
         version=angle_version),
     dict(type='Normalize', **img_norm_cfg),
     dict(type='Pad', size_divisor=32),
     dict(type='DefaultFormatBundle'),
     dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels'])
 ]
+
+
 data = dict(
+    samples_per_gpu=2,
+    workers_per_gpu=2,
     train=dict(pipeline=train_pipeline, version=angle_version),
     val=dict(version=angle_version),
     test=dict(version=angle_version))
+
+optimizer = dict(
+    _delete_=True,
+    type='AdamW',
+    lr=0.0001,
+    betas=(0.9, 0.999),
+    weight_decay=0.05)
+
+evaluation = dict(interval=4, metric='mAP')

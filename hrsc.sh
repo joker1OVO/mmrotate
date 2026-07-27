@@ -1,6 +1,7 @@
 #!/bin/bash
+export LD_PRELOAD="${CONDA_PREFIX}/lib/libcufft.so.10"
 
-CONFIG="configs/afe/$1"
+CONFIG="configs/safe/$1"
 WORK_DIR="runs/hrsc/$2"
 TEST_CONFIG="$WORK_DIR/$1"   # 测试用 runs 目录下的配置文件
 MODE=${3:-7}   # 默认模式为 7 (VOC2007)

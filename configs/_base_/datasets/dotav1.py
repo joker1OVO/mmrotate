@@ -1,15 +1,10 @@
 # dataset settings
 angle_version = 'le90'
 dataset_type = 'DOTADataset'
-data_root = 'data/split_ss_dota/'
+data_root = 'data/ss_dota/'
 img_norm_cfg = dict(
     mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
 train_pipeline = [
-    dict(
-    type='DebugSample',
-    action=lambda x: print("正在加载:", x['img_info']['filename'])
-    ),
-    dict(type='LoadImageFromFile'),
     dict(type='LoadImageFromFile'),
     dict(type='LoadAnnotations', with_bbox=True),
     dict(type='RResize', img_scale=(1024, 1024)),
