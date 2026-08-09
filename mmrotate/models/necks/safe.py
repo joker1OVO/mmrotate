@@ -232,12 +232,15 @@ class FreqDualBranch(nn.Module):
 
     .. code-block:: text
 
-        x → rFFT → [Re, Im] ─┬─ H-Strip(1×K) → W-Strip(K×1) on Re/Im  (水平-垂直)
-                              └─ DWConv(3×3) on Re/Im                   (方形)
-                           → sum Re, sum Im
-                           → complex → irFFT → 1×1 Proj
+        x → rFFT → [Re, Im] ─┬─ H-Strip(1×K) → W-Strip(K×1) → irFFT ─┐
+                              └─ DWConv(3×3) → irFFT ─────────────────┤
+                                                                       │
+                              spatial-domain sum ←─────────────────────┘
+                                  │
+                               1×1 Proj
 
-    Two parallel branches on the same rFFT result, sharing one irFFT.
+    Two parallel branches on the same rFFT result, each with its own irFFT,
+    fused by element-wise sum in the spatial domain.
     The H-W branch applies horizontal then vertical strip convolutions
     sequentially, while the square branch applies 2D local frequency mixing.
     Each branch processes Re and Im with separate (unshared) weights.
@@ -282,16 +285,25 @@ class FreqDualBranch(nn.Module):
         x_fft = torch.fft.rfft2(x)                     # [B, C, H, W//2+1]
         x_re, x_im = x_fft.real, x_fft.imag
 
-        # Two parallel branches:
-        #   ① H→W sequential strip (水平-垂直)
-        #   ② 3×3 DWConv (方形)
+        # Two parallel branches — each gets its own irFFT, fused in spatial domain:
+        #   ① H→W sequential strip (水平-垂直) → irFFT
+        #   ② 3×3 DWConv (方形) → irFFT
         # Each with separate Re/Im weights
-        re_out = (self.w_re(self.h_re(x_re)) + self.conv2d_re(x_re))
-        im_out = (self.w_im(self.h_im(x_im)) + self.conv2d_im(x_im))
 
-        x_freq = torch.complex(re_out, im_out)
-        out = torch.fft.irfft2(x_freq, s=(x.shape[2], x.shape[3]))
-        return self.proj(out)
+        # Branch ①: H→W strip
+        re_strip = self.w_re(self.h_re(x_re))
+        im_strip = self.w_im(self.h_im(x_im))
+        out_strip = torch.fft.irfft2(torch.complex(re_strip, im_strip),
+                                     s=(x.shape[2], x.shape[3]))
+
+        # Branch ②: 3×3 DWConv
+        re_2d = self.conv2d_re(x_re)
+        im_2d = self.conv2d_im(x_im)
+        out_2d = torch.fft.irfft2(torch.complex(re_2d, im_2d),
+                                  s=(x.shape[2], x.shape[3]))
+
+        # Fuse in spatial domain
+        return self.proj(out_strip + out_2d)
 
 
 # ============================ ARFCBlock（多分支总模块） ============================
@@ -302,30 +314,24 @@ class ARFCBlock(nn.Module):
     .. code-block:: text
 
         y = x                          ← residual (identity skip)
-          + LargeKernel(x)             ← 3分支深度可分离大核卷积 (5×5+7×7+9×9, 相加)
-          + merge(                     ← 旋转分支 (三分支, 1×1 conv fusion)
-              LCE(x)                   ←   ① 大核/水平条带 (原始特征, 不旋转)
-            + A2RC(x)                  ←   ② FFT自适应旋转 + strip conv
-            + Rot45(x)                 ←   ③ 固定45°旋转 + strip conv
-            )
-          + FTB(x)                     ← 频域双分支: H→W-Strip + 3×3
-                                         (rFFT → 2路并行 → sum → irFFT)
+          + A²RC(x)                    ← 旋转自适应卷积 (LCE+A²RC+Rot45 → 1×1 merge)
+          + FTB(x)                     ← 频域双分支 (各自irFFT → 空间域相加)
+          + LargeKernel(x)             ← 大核卷积 (DWConv 5×5+7×7+9×9, 相加)
 
 
     - **大核卷积分支 (Large Kernel Convolution)** : 3 个并行的深度可分离大核卷积,
       kernel_size=[5,7,9] (DWConv, groups=channels), 各自独立权重, 通道不变(256), 输出按元素相加.
 
-    - **旋转分支 (Rotation, 三分支)** :
+    - **A²RC（旋转自适应卷积）** : 三个子分支共享输入、各自处理、相加后 1×1 融合.
       ① LCE — H+W strip DWConv (1×11 / 11×1) on original feature.
-      ② A²RC — FFT-estimated rotation + strip conv + rotate back.
+      ② Angle-Adaptive — FFT-estimated rotation + strip conv + rotate back.
       ③ Rot45 — fixed +45° rotation + strip conv + rotate back.
-      Summed and fused through a 1×1 merge conv.
 
-    - **频域双分支 (FTB)** :
-      rFFT → [Re, Im] → two parallel branches:
-      ① H-Strip(1×K) → W-Strip(K×1) sequential along frequency axes,
-      ② DWConv(3×3) 2D local frequency mixing.
-      → sum Re, sum Im → irFFT → 1×1 Proj.
+    - **FTB（频域双分支）** :
+      rFFT → [Re, Im] → two parallel branches, each with its own irFFT, fused in spatial domain:
+      ① H-Strip(1×K) → W-Strip(K×1) → irFFT,
+      ② DWConv(3×3) → irFFT.
+      → element-wise sum → 1×1 Proj.
       Re/Im use independent (unshared) weights per branch.
 
     - **Residual** : identity skip connection ``+ x``.
@@ -344,12 +350,12 @@ class ARFCBlock(nn.Module):
         self.enable_fdsc = enable_fdsc
         self.enable_large_kernel = enable_large_kernel
 
-        # ==================== 旋转分支 (三分支): LCE + A²RC + Rot45 ====================
-        # ① LCE: 大核/水平条带卷积 (原始特征, 不旋转)
+        # ==================== A²RC（旋转自适应卷积，三分支 → 1×1 merge） ====================
+        # ① LCE: 水平+垂直条带卷积 (原始特征, 不旋转)
         if enable_lce:
             self.lce = LCE(channels, strip_kernel)
 
-        # ② A²RC: FFT自适应旋转 + strip conv
+        # ② Angle-Adaptive: FFT自适应旋转 + strip conv
         if enable_a2rc:
             self.a2rc = A2RC(channels, strip_kernel=strip_kernel)
 
@@ -384,35 +390,35 @@ class ARFCBlock(nn.Module):
         # ---- Residual (identity) ----
         identity = x
 
-        # ==================== 旋转分支 (三分支): LCE + A²RC + Rot45 ====================
+        # ==================== A²RC（旋转自适应卷积，三分支 → 1×1 merge） ====================
         rotation_out = 0
-        # ① LCE: 大核/水平条带 (原始特征, 不旋转)
+        # ① LCE: 水平+垂直条带 (原始特征, 不旋转)
         if self.enable_lce:
             rotation_out = rotation_out + self.lce(x)
-        # ② A²RC: FFT自适应旋转 + strip conv
+        # ② Angle-Adaptive: FFT自适应旋转 + strip conv
         if self.enable_a2rc:
             rotation_out = rotation_out + self.a2rc(x)
         # ③ Rot45: 固定45°旋转 + strip conv
         if self.enable_rot45:
             rotation_out = rotation_out + self.rot45(x)
 
-        # 1×1 merge for rotation branch (3 sub-branches → 1)
+        # 1×1 merge (3 sub-branches → 1)
         if self.rot_merge is not None:
             rotation_out = self.rot_merge(rotation_out)
 
-        # ==================== 频域双分支: FTB (独立) ====================
+        # ==================== FTB（频域双分支） ====================
         freq_out = 0
         if self.enable_fdsc:
             freq_out = self.ftb(x)
 
-        # ==================== 大核卷积分支: 3 个深度可分离大核卷积 (k=5,7,9) ====================
+        # ==================== Large Kernel（大核卷积分支，k=5,7,9） ====================
         large_kernel_out = 0
         if self.enable_large_kernel:
             for conv in self.large_kernel_convs:
                 large_kernel_out = large_kernel_out + conv(x)
 
         # ==================== 最终求和 ====================
-        # y = x + 深度可分离大核卷积(3分支相加) + 旋转分支(LCE+A²RC+Rot45→merge) + 频域双分支(FTB)
+        # y = x + A²RC(x) + FTB(x) + LargeKernel(x)
         return identity + large_kernel_out + rotation_out + freq_out
 
 
@@ -426,9 +432,9 @@ class SAFEFPN(FPN):
     each fusion step.
 
     Each SAFE (ARFCBlock) contains:
-      - 大核卷积分支: 3 个并行的深度可分离大核卷积 (k=5,7,9), 相加.
-      - 旋转分支 (三分支): LCE(大核/水平条带) + A²RC(FFT旋转) + Rot45(固定45°) → 1×1 merge.
-      - 频域双分支 (FTB): rFFT → H→W-Strip + 3×3 DWConv → sum → irFFT.
+      - A²RC（旋转自适应卷积）: LCE + Angle-Adaptive + Rot45 三个子分支 → 1×1 merge.
+      - FTB（频域双分支）: rFFT → 两路各自irFFT → 空间域相加.
+      - Large Kernel（大核卷积）: 3 个并行 DWConv (k=5,7,9), 相加.
 
     Args:
         in_channels (list[int]): Input channels per scale.
@@ -436,13 +442,13 @@ class SAFEFPN(FPN):
         num_outs (int): Number of output scales.
         fusion_modes (list[str]): ``'add'`` or ``'safe'``.
         safe_strip_kernel (int): Strip conv kernel size. Default: 11.
-        safe_freq_kernel (int): FDSC kernel size. Default: 3.
+        safe_freq_kernel (int): FTB kernel size. Default: 3.
         safe_large_kernels (list[int]): Large kernel sizes. Default: [5, 7, 9].
-        safe_enable_lce (bool): 大核分支 LCE. Default: True.
-        safe_enable_a2rc (bool): 旋转分支 A²RC. Default: True.
-        safe_enable_rot45 (bool): 旋转分支 Rot45 (固定45°). Default: True.
-        safe_enable_fdsc (bool): 频域分支 FDSC. Default: True.
-        safe_enable_large_kernel (bool): 大核卷积分支. Default: True.
+        safe_enable_lce (bool): A²RC 子分支 LCE. Default: True.
+        safe_enable_a2rc (bool): A²RC 子分支 Angle-Adaptive. Default: True.
+        safe_enable_rot45 (bool): A²RC 子分支 Rot45. Default: True.
+        safe_enable_fdsc (bool): FTB 频域双分支. Default: True.
+        safe_enable_large_kernel (bool): Large Kernel 大核卷积分支. Default: True.
     """
 
     def __init__(self,
